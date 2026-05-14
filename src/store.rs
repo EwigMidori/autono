@@ -3,6 +3,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -17,17 +18,24 @@ pub struct Store {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[builder(setter(into))]
 pub struct StoredItem {
     pub owner: String,
     pub repo: String,
     pub item_id: String,
     pub state: ManagedState,
+    #[builder(default)]
     pub branch: Option<String>,
+    #[builder(default)]
     pub worktree_path: Option<String>,
+    #[builder(default)]
     pub pr_number: Option<i64>,
+    #[builder(default)]
     pub last_comment_id: Option<i64>,
+    #[builder(default)]
     pub last_review_id: Option<i64>,
+    #[builder(default = "OffsetDateTime::now_utc()")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -101,17 +109,15 @@ impl Store {
         last_comment_id: Option<i64>,
     ) -> Result<StoredItem> {
         let existing = self.get_item(key.owner, key.repo, key.item_id)?;
-        let mut item = existing.unwrap_or_else(|| StoredItem {
-            owner: key.owner.to_string(),
-            repo: key.repo.to_string(),
-            item_id: key.item_id.to_string(),
-            state,
-            branch: None,
-            worktree_path: None,
-            pr_number: None,
-            last_comment_id,
-            last_review_id: None,
-            updated_at: OffsetDateTime::now_utc(),
+        let mut item = existing.unwrap_or_else(|| {
+            StoredItemBuilder::default()
+                .owner(key.owner)
+                .repo(key.repo)
+                .item_id(key.item_id)
+                .state(state)
+                .last_comment_id(last_comment_id)
+                .build()
+                .expect("stored item builder was missing required fields after explicit initialization")
         });
         item.state = state;
         if let Some(last_comment_id) = last_comment_id {
@@ -131,7 +137,13 @@ impl Store {
         let mut item = self
             .get_item(key.owner, key.repo, key.item_id)?
             .unwrap_or_else(|| {
-                StoredItem::new(key.owner, key.repo, key.item_id, ManagedState::Working)
+                StoredItemBuilder::default()
+                    .owner(key.owner)
+                    .repo(key.repo)
+                    .item_id(key.item_id)
+                    .state(ManagedState::Working)
+                    .build()
+                    .expect("stored item builder was missing required fields after explicit initialization")
             });
         item.state = ManagedState::Working;
         item.branch = Some(branch.to_string());
@@ -145,7 +157,13 @@ impl Store {
         let mut item = self
             .get_item(key.owner, key.repo, key.item_id)?
             .unwrap_or_else(|| {
-                StoredItem::new(key.owner, key.repo, key.item_id, ManagedState::PrOpen)
+                StoredItemBuilder::default()
+                    .owner(key.owner)
+                    .repo(key.repo)
+                    .item_id(key.item_id)
+                    .state(ManagedState::PrOpen)
+                    .build()
+                    .expect("stored item builder was missing required fields after explicit initialization")
             });
         item.state = ManagedState::PrOpen;
         item.pr_number = Some(pr_number);
@@ -162,12 +180,13 @@ impl Store {
         let mut item = self
             .get_item(key.owner, key.repo, key.item_id)?
             .unwrap_or_else(|| {
-                StoredItem::new(
-                    key.owner,
-                    key.repo,
-                    key.item_id,
-                    ManagedState::ReviewPending,
-                )
+                StoredItemBuilder::default()
+                    .owner(key.owner)
+                    .repo(key.repo)
+                    .item_id(key.item_id)
+                    .state(ManagedState::ReviewPending)
+                    .build()
+                    .expect("stored item builder was missing required fields after explicit initialization")
             });
         item.last_review_id = review_id;
         item.updated_at = OffsetDateTime::now_utc();
@@ -209,21 +228,6 @@ impl Store {
 }
 
 impl StoredItem {
-    pub fn new(owner: &str, repo: &str, item_id: &str, state: ManagedState) -> Self {
-        Self {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            item_id: item_id.to_string(),
-            state,
-            branch: None,
-            worktree_path: None,
-            pr_number: None,
-            last_comment_id: None,
-            last_review_id: None,
-            updated_at: OffsetDateTime::now_utc(),
-        }
-    }
-
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let state_raw: String = row.get(3)?;
         let updated_at_raw: String = row.get(9)?;

@@ -11,7 +11,7 @@ use crate::config::{Config, TargetConfig};
 use crate::error::{Result, ResultContext};
 use crate::git_workspace::{GitWorkspace, WorkIdentity, WorkspaceManager};
 use crate::github::{GitHub, NewPullRequest, ProjectContent, ProjectItem};
-use crate::store::{Store, StoreItemKey, StoredItem};
+use crate::store::{Store, StoreItemKey, StoredItem, StoredItemBuilder};
 use crate::workflow::{
     AdminMention, AutonoMarker, BotMentionPolicy, CommentThread, CommentView, ItemView,
     ManagedState, ReviewDecision, TriageResult, WorkflowAction, WorkflowPolicy,
@@ -124,8 +124,13 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             .get_item(&target.owner, &target.repo, &item.id)?
             .or_else(|| {
                 thread.latest_marker_state().map(|marker| {
-                    let mut stored =
-                        StoredItem::new(&target.owner, &target.repo, &item.id, marker.state);
+                    let mut stored = StoredItemBuilder::default()
+                        .owner(&target.owner)
+                        .repo(&target.repo)
+                        .item_id(&item.id)
+                        .state(marker.state)
+                        .build()
+                        .expect("stored item builder was missing required fields after explicit initialization");
                     stored.last_comment_id = Some(marker.comment_id);
                     stored
                 })
