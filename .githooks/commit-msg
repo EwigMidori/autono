@@ -4,20 +4,10 @@ set -eu
 commit_msg_file="${1:?commit message file path is required}"
 first_line="$(head -n 1 "$commit_msg_file")"
 
-case "$first_line" in
-  CC\(*\):\ *)
-    scope_part="${first_line#CC(}"
-    scope_part="${scope_part%%):*}"
-    subject_part="${first_line#CC(*): }"
+if printf '%s\n' "$first_line" | grep -Eq '^(feat|fix|chore|docs|refactor|test|ci|build|perf|style|revert)/[^:[:space:]]+: .+'; then
+  exit 0
+fi
 
-    if [ -z "$scope_part" ] || [ -z "$subject_part" ]; then
-      echo "commit message must use: CC(scope): subject"
-      exit 1
-    fi
-    ;;
-  *)
-    echo "commit message must use: CC(scope): subject"
-    echo "example: CC(readme): rewrite the English documentation"
-    exit 1
-    ;;
-esac
+echo "commit message must use: type/scope: subject"
+echo "example: feat/refaco: rewrite the English documentation"
+exit 1
