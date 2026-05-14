@@ -76,6 +76,8 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
     pub async fn run_forever(&self) -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(self.config.poll_interval_secs));
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+        let mut listen_for_shutdown = true;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -83,10 +85,17 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                         error!(error = ?err, "poll failed");
                     }
                 }
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("failed to listen for ctrl-c")?;
-                    info!("shutting down");
-                    return Ok(());
+                signal = &mut shutdown, if listen_for_shutdown => {
+                    match signal {
+                        Ok(()) => {
+                            info!("shutting down");
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            error!(error = ?err, "ctrl-c listener failed; continuing without signal handling");
+                            listen_for_shutdown = false;
+                        }
+                    }
                 }
             }
         }
@@ -273,30 +282,6 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             &result,
             &request.target.workflow.start_status,
         );
-        self.github
-            .create_issue_comment(request.target, request.content.number, &body)
-            .await?;
-        match state {
-            ManagedState::AwaitingStart => {
-                self.github
-                    .set_project_status(
-                        request.target,
-                        request.item,
-                        &request.target.workflow.triaged_status,
-                    )
-                    .await?;
-            }
-            ManagedState::Blocked => {
-                self.github
-                    .set_project_status(
-                        request.target,
-                        request.item,
-                        &request.target.workflow.blocked_status,
-                    )
-                    .await?;
-            }
-            _ => {}
-        }
         self.store.mark_state(
             StoreItemKey::new(
                 &request.target.owner,
@@ -306,6 +291,27 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             state,
             request.latest_comment_id,
         )?;
+        self.try_create_issue_comment(request.target, request.content.number, &body)
+            .await;
+        match state {
+            ManagedState::AwaitingStart => {
+                self.try_set_project_status(
+                    request.target,
+                    request.item,
+                    &request.target.workflow.triaged_status,
+                )
+                .await;
+            }
+            ManagedState::Blocked => {
+                self.try_set_project_status(
+                    request.target,
+                    request.item,
+                    &request.target.workflow.blocked_status,
+                )
+                .await;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -367,18 +373,6 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             }
         }
         if let Some(err) = last_error {
-            self.github
-                .create_issue_comment(
-                    work.target,
-                    work.content.number,
-                    &self
-                        .comment_composer
-                        .blocked_validation_comment(work.item, &err),
-                )
-                .await?;
-            self.github
-                .set_project_status(work.target, work.item, &work.target.workflow.blocked_status)
-                .await?;
             self.store.mark_state(
                 store_key,
                 ManagedState::Blocked,
@@ -388,6 +382,20 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     .map(|comment| comment.id)
                     .max(),
             )?;
+            self.try_create_issue_comment(
+                work.target,
+                work.content.number,
+                &self
+                    .comment_composer
+                    .blocked_validation_comment(work.item, &err),
+            )
+            .await;
+            self.try_set_project_status(
+                work.target,
+                work.item,
+                &work.target.workflow.blocked_status,
+            )
+            .await;
             return Ok(());
         }
 
@@ -411,20 +419,6 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         {
             Some(pr) => pr,
             None if !committed => {
-                self.github
-                    .create_issue_comment(
-                        work.target,
-                        work.content.number,
-                        &self.comment_composer.no_changes_comment(work.item),
-                    )
-                    .await?;
-                self.github
-                    .set_project_status(
-                        work.target,
-                        work.item,
-                        &work.target.workflow.blocked_status,
-                    )
-                    .await?;
                 self.store.mark_state(
                     store_key,
                     ManagedState::Blocked,
@@ -434,11 +428,22 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                         .map(|comment| comment.id)
                         .max(),
                 )?;
+                self.try_create_issue_comment(
+                    work.target,
+                    work.content.number,
+                    &self.comment_composer.no_changes_comment(work.item),
+                )
+                .await;
+                self.try_set_project_status(
+                    work.target,
+                    work.item,
+                    &work.target.workflow.blocked_status,
+                )
+                .await;
                 return Ok(());
             }
             None => {
-                let pr = self
-                    .github
+                self.github
                     .create_pull_request(
                         work.target,
                         &NewPullRequest {
@@ -448,11 +453,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                             base: work.target.base_branch.clone(),
                         },
                     )
-                    .await?;
-                self.github
-                    .request_reviewers(work.target, pr.number, &work.target.review.reviewers)
-                    .await?;
-                pr
+                    .await?
             }
         };
         self.store.attach_pr(store_key, pr.number)?;
@@ -465,9 +466,10 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             self.store
                 .mark_review_handled(store_key, work.handled_review_id)?;
         }
-        self.github
-            .set_project_status(work.target, work.item, &work.target.workflow.review_status)
-            .await?;
+        self.try_request_reviewers(work.target, pr.number, &work.target.review.reviewers)
+            .await;
+        self.try_set_project_status(work.target, work.item, &work.target.workflow.review_status)
+            .await;
         Ok(())
     }
 
@@ -477,22 +479,72 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         item: &ProjectItem,
         content: &ProjectContent,
     ) -> Result<()> {
-        self.github
-            .set_project_status(target, item, &target.workflow.done_status)
-            .await?;
-        self.github
-            .create_issue_comment(
-                target,
-                content.number,
-                &self.comment_composer.completion_comment(item),
-            )
-            .await?;
         self.store.mark_state(
             StoreItemKey::new(&target.owner, &target.repo, &item.id),
             ManagedState::Done,
             None,
         )?;
+        self.try_set_project_status(target, item, &target.workflow.done_status)
+            .await;
+        self.try_create_issue_comment(
+            target,
+            content.number,
+            &self.comment_composer.completion_comment(item),
+        )
+        .await;
         Ok(())
+    }
+
+    async fn try_create_issue_comment(&self, target: &TargetConfig, issue_number: i64, body: &str) {
+        if let Err(err) = self
+            .github
+            .create_issue_comment(target, issue_number, body)
+            .await
+        {
+            warn!(
+                repo = target.full_name(),
+                issue_number,
+                error = ?err,
+                "failed to create issue comment"
+            );
+        }
+    }
+
+    async fn try_set_project_status(
+        &self,
+        target: &TargetConfig,
+        item: &ProjectItem,
+        status: &str,
+    ) {
+        if let Err(err) = self.github.set_project_status(target, item, status).await {
+            warn!(
+                repo = target.full_name(),
+                item_id = item.id,
+                status,
+                error = ?err,
+                "failed to set project status"
+            );
+        }
+    }
+
+    async fn try_request_reviewers(
+        &self,
+        target: &TargetConfig,
+        pr_number: i64,
+        reviewers: &[String],
+    ) {
+        if let Err(err) = self
+            .github
+            .request_reviewers(target, pr_number, reviewers)
+            .await
+        {
+            warn!(
+                repo = target.full_name(),
+                pr_number,
+                error = ?err,
+                "failed to request reviewers"
+            );
+        }
     }
 }
 

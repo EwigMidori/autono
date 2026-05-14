@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -7,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::process::Command;
+use tokio::time as tokio_time;
 
 use crate::config::{GitHubConfig, TargetConfig, TokenSource};
 use crate::error::{Error, OptionContext, Result, ResultContext};
@@ -20,6 +22,9 @@ use crate::workflow::{CommentView, ReviewDecision};
 
 const MAX_GRAPHQL_PAGES: usize = 100;
 const MAX_REST_PAGES: usize = 100;
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -141,6 +146,8 @@ impl GitHubClient {
         );
         let rest = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+            .timeout(GITHUB_REQUEST_TIMEOUT)
             .build()
             .context("failed to build GitHub HTTP client")?;
         Ok(Self {
@@ -569,11 +576,14 @@ impl<'a> GitHubAuthenticator<'a> {
     }
 
     async fn gh_token(&self) -> Result<String> {
-        let output = Command::new("gh")
+        let mut command = Command::new("gh");
+        command
             .args(["auth", "token"])
             .stdin(Stdio::null())
-            .output()
+            .kill_on_drop(true);
+        let output = tokio_time::timeout(GH_TOKEN_TIMEOUT, command.output())
             .await
+            .map_err(|_| Error::timeout("gh auth token exceeded 30 seconds"))?
             .context("failed to run gh auth token")?;
         if !output.status.success() {
             return Err(Error::message(format!(

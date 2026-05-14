@@ -11,11 +11,12 @@ use crate::config::{
     CommandsConfig, Config, GitHubConfig, ReviewConfig, TargetConfig, TokenSource, WorkflowConfig,
 };
 use crate::daemon::{CommentComposer, Daemon};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git_workspace::{WorkIdentity, WorkspaceManager};
 use crate::github::{
     GitHub, NewPullRequest, ProjectContent, ProjectContentKind, ProjectItem, PullRequestInfo,
 };
+use crate::store::Store;
 use crate::workflow::{CommentView, ManagedState, ReviewDecision, TriageResult};
 
 const TEST_BOT_LOGIN: &str = "mtshit";
@@ -77,6 +78,9 @@ struct FakeGitHubState {
     next_review_id: i64,
     prs_created: usize,
     reviewers_requested: Vec<String>,
+    fail_comments: bool,
+    fail_statuses: bool,
+    fail_reviewers: bool,
 }
 
 impl FakeGitHub {
@@ -91,6 +95,9 @@ impl FakeGitHub {
                 next_review_id: 1,
                 prs_created: 0,
                 reviewers_requested: Vec::new(),
+                fail_comments: false,
+                fail_statuses: false,
+                fail_reviewers: false,
             })),
         }
     }
@@ -127,6 +134,18 @@ impl FakeGitHub {
     fn statuses(&self) -> Vec<String> {
         self.state.lock().unwrap().statuses.clone()
     }
+
+    fn fail_comments(&self) {
+        self.state.lock().unwrap().fail_comments = true;
+    }
+
+    fn fail_statuses(&self) {
+        self.state.lock().unwrap().fail_statuses = true;
+    }
+
+    fn fail_reviewers(&self) {
+        self.state.lock().unwrap().fail_reviewers = true;
+    }
 }
 
 #[async_trait]
@@ -158,6 +177,9 @@ impl GitHub for FakeGitHub {
         body: &str,
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        if state.fail_comments {
+            return Err(Error::message("comment creation failed"));
+        }
         let id = state
             .comments
             .iter()
@@ -181,6 +203,9 @@ impl GitHub for FakeGitHub {
         status: &str,
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        if state.fail_statuses {
+            return Err(Error::message("status update failed"));
+        }
         state.item.status = Some(status.to_string());
         state.statuses.push(status.to_string());
         Ok(())
@@ -217,11 +242,11 @@ impl GitHub for FakeGitHub {
         _pr_number: i64,
         reviewers: &[String],
     ) -> Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .reviewers_requested
-            .extend(reviewers.iter().cloned());
+        let mut state = self.state.lock().unwrap();
+        if state.fail_reviewers {
+            return Err(Error::message("reviewer request failed"));
+        }
+        state.reviewers_requested.extend(reviewers.iter().cloned());
         Ok(())
     }
 }
@@ -390,6 +415,114 @@ async fn daemon_does_not_repeat_same_changes_requested_review() {
 
     daemon.run_once().await.unwrap();
     assert_eq!(*workspace.committed.lock().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn validation_failure_persists_blocked_when_github_side_effects_fail() {
+    let temp = tempdir().unwrap();
+    let mut target = target(temp.path().join("checkout"));
+    target.commands.test = vec!["false".to_string()];
+    target.commands.max_fix_attempts = 0;
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(
+        project_item("Todo"),
+        vec![CommentView {
+            id: 1,
+            author: "admin".to_string(),
+            body: format!("@{} please fix the bug", TEST_BOT_LOGIN),
+            created_at: OffsetDateTime::now_utc(),
+        }],
+    );
+    let workspace = FakeWorkspace {
+        root: temp.path().join("worktrees"),
+        committed: Arc::new(Mutex::new(0)),
+        pushed: Arc::new(Mutex::new(0)),
+    };
+    let daemon =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    github.fail_comments();
+    github.fail_statuses();
+    daemon.run_once().await.unwrap();
+
+    let store = Store::open(state_path).unwrap();
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::Blocked);
+    assert_eq!(*workspace.committed.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn reviewer_request_failure_does_not_block_pr_state() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(
+        project_item("Todo"),
+        vec![CommentView {
+            id: 1,
+            author: "admin".to_string(),
+            body: format!("@{} please fix the bug", TEST_BOT_LOGIN),
+            created_at: OffsetDateTime::now_utc(),
+        }],
+    );
+    let workspace = FakeWorkspace {
+        root: temp.path().join("worktrees"),
+        committed: Arc::new(Mutex::new(0)),
+        pushed: Arc::new(Mutex::new(0)),
+    };
+    let daemon =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    github.fail_reviewers();
+    daemon.run_once().await.unwrap();
+
+    let store = Store::open(state_path).unwrap();
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::PrOpen);
+    assert_eq!(stored.pr_number, Some(1));
+    assert_eq!(*workspace.committed.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn completion_persists_done_when_github_side_effects_fail() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(
+        project_item("Todo"),
+        vec![CommentView {
+            id: 1,
+            author: "admin".to_string(),
+            body: format!("@{} please fix the bug", TEST_BOT_LOGIN),
+            created_at: OffsetDateTime::now_utc(),
+        }],
+    );
+    let workspace = FakeWorkspace {
+        root: temp.path().join("worktrees"),
+        committed: Arc::new(Mutex::new(0)),
+        pushed: Arc::new(Mutex::new(0)),
+    };
+    let daemon =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    daemon.run_once().await.unwrap();
+    github.merge_pr();
+    github.fail_comments();
+    github.fail_statuses();
+    daemon.run_once().await.unwrap();
+
+    let store = Store::open(state_path).unwrap();
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::Done);
 }
 
 #[test]

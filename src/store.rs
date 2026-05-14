@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 
-use rusqlite::{params, Connection, OptionalExtension};
 use derive_builder::Builder;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -117,7 +117,9 @@ impl Store {
                 .state(state)
                 .last_comment_id(last_comment_id)
                 .build()
-                .expect("stored item builder was missing required fields after explicit initialization")
+                .expect(
+                    "stored item builder was missing required fields after explicit initialization",
+                )
         });
         item.state = state;
         if let Some(last_comment_id) = last_comment_id {
