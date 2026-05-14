@@ -51,7 +51,7 @@ pub(crate) struct ItemView {
     pub(crate) managed_state: Option<ManagedState>,
     pub(crate) project_status: Option<String>,
     pub(crate) has_admin_mention: bool,
-    pub(crate) has_new_human_comment: bool,
+    pub(crate) has_new_admin_mention: bool,
     pub(crate) has_pr: bool,
     pub(crate) pr_merged: bool,
     pub(crate) review_decision: ReviewDecision,
@@ -112,7 +112,7 @@ impl WorkflowPolicy {
             },
             Some(ManagedState::Done) => WorkflowAction::Ignore,
             Some(ManagedState::Blocked) => {
-                if view.has_new_human_comment {
+                if view.has_new_admin_mention {
                     WorkflowAction::Triage
                 } else {
                     WorkflowAction::WaitForStart
@@ -251,7 +251,9 @@ impl CommentThread {
             .filter(|comment| policy.contains_mention(&comment.body))
             .filter(|comment| is_admin(&comment.author))
             .max_by_key(|comment| comment.created_at)
-            .map(|_| AdminMention)
+            .map(|comment| AdminMention {
+                comment_id: comment.id,
+            })
     }
 
     pub(crate) fn latest_marker_state(&self) -> Option<MarkerView> {
@@ -273,18 +275,6 @@ impl CommentThread {
             .map(|comment| comment.id)
             .max()
     }
-
-    pub(crate) fn has_new_human_comment_since(
-        &self,
-        last_seen: Option<i64>,
-        bot_login: &str,
-    ) -> bool {
-        let latest = self.latest_human_comment_id(bot_login);
-        latest
-            .zip(last_seen)
-            .map(|(latest, last)| latest > last)
-            .unwrap_or(latest.is_some())
-    }
 }
 
 impl From<Vec<CommentView>> for CommentThread {
@@ -295,7 +285,9 @@ impl From<Vec<CommentView>> for CommentThread {
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-pub(crate) struct AdminMention;
+pub(crate) struct AdminMention {
+    pub(crate) comment_id: i64,
+}
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,7 +339,7 @@ mod tests {
             managed_state: None,
             project_status: Some("Todo".to_string()),
             has_admin_mention: false,
-            has_new_human_comment: false,
+            has_new_admin_mention: false,
             has_pr: false,
             pr_merged: false,
             review_decision: ReviewDecision::None,
@@ -363,7 +355,7 @@ mod tests {
             managed_state: Some(ManagedState::AwaitingStart),
             project_status: Some("Triaged".to_string()),
             has_admin_mention: true,
-            has_new_human_comment: false,
+            has_new_admin_mention: false,
             has_pr: false,
             pr_merged: false,
             review_decision: ReviewDecision::None,
@@ -384,7 +376,7 @@ mod tests {
             managed_state: Some(ManagedState::PrOpen),
             project_status: Some("In Review".to_string()),
             has_admin_mention: true,
-            has_new_human_comment: false,
+            has_new_admin_mention: false,
             has_pr: true,
             pr_merged: false,
             review_decision: ReviewDecision::ChangesRequested,
@@ -410,7 +402,7 @@ mod tests {
             managed_state: Some(ManagedState::ReviewPending),
             project_status: Some("In Review".to_string()),
             has_admin_mention: true,
-            has_new_human_comment: false,
+            has_new_admin_mention: false,
             has_pr: true,
             pr_merged: false,
             review_decision: ReviewDecision::ChangesRequested,
@@ -427,5 +419,27 @@ mod tests {
             policy.decide_next_action(&view),
             WorkflowAction::ApplyReviewFeedback
         );
+    }
+
+    #[test]
+    fn blocked_item_requires_new_admin_mention_to_retriage() {
+        let mut view = ItemView {
+            managed_state: Some(ManagedState::Blocked),
+            project_status: Some("Blocked".to_string()),
+            has_admin_mention: true,
+            has_new_admin_mention: false,
+            has_pr: false,
+            pr_merged: false,
+            review_decision: ReviewDecision::None,
+            has_unhandled_review: false,
+        };
+        let policy = WorkflowPolicy::new(workflow());
+
+        assert_eq!(
+            policy.decide_next_action(&view),
+            WorkflowAction::WaitForStart
+        );
+        view.has_new_admin_mention = true;
+        assert_eq!(policy.decide_next_action(&view), WorkflowAction::Triage);
     }
 }

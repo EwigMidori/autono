@@ -11,7 +11,7 @@ use crate::config::{Config, TargetConfig};
 use crate::error::{Result, ResultContext};
 use crate::git_workspace::{GitWorkspace, WorkIdentity, WorkspaceManager};
 use crate::github::{GitHub, NewPullRequest, ProjectContent, ProjectItem};
-use crate::store::{Store, StoredItem};
+use crate::store::{Store, StoreItemKey, StoredItem};
 use crate::workflow::{
     AdminMention, AutonoMarker, BotMentionPolicy, CommentThread, CommentView, ItemView,
     ManagedState, ReviewDecision, TriageResult, WorkflowAction, WorkflowPolicy,
@@ -40,6 +40,16 @@ struct WorkRequest<'a> {
     handled_review_id: Option<i64>,
 }
 
+#[non_exhaustive]
+#[derive(Debug)]
+struct TriageRequest<'a> {
+    target: &'a TargetConfig,
+    item: &'a ProjectItem,
+    content: &'a ProjectContent,
+    thread: &'a CommentThread,
+    latest_comment_id: Option<i64>,
+}
+
 impl<G: GitHub> Daemon<G, CodexRunner, GitWorkspace> {
     pub fn new(config: Config, github: G) -> Result<Self> {
         let runner = CodexRunner;
@@ -65,6 +75,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
 
     pub async fn run_forever(&self) -> Result<()> {
         let mut interval = time::interval(Duration::from_secs(self.config.poll_interval_secs));
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -122,9 +133,15 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         let mention = self.admin_mention(target, &thread).await?;
         let has_admin_mention = mention.is_some();
         let last_seen_comment_id = stored.as_ref().and_then(|item| item.last_comment_id);
+        let has_new_admin_mention = mention
+            .as_ref()
+            .map(|mention| {
+                last_seen_comment_id
+                    .map(|last_seen| mention.comment_id > last_seen)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
         let latest_human_comment_id = thread.latest_human_comment_id(&self.config.bot_login);
-        let has_new_human_comment =
-            thread.has_new_human_comment_since(last_seen_comment_id, &self.config.bot_login);
 
         let pr = match stored.as_ref().and_then(|stored| stored.branch.clone()) {
             Some(branch) => self.github.find_agent_pr(target, &branch).await?,
@@ -138,7 +155,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             managed_state: stored.as_ref().map(|stored| stored.state),
             project_status: item.status.clone(),
             has_admin_mention,
-            has_new_human_comment,
+            has_new_admin_mention,
             has_pr: pr.is_some() || stored.as_ref().and_then(|item| item.pr_number).is_some(),
             pr_merged: pr.as_ref().map(|pr| pr.merged).unwrap_or(false),
             review_decision: pr
@@ -149,13 +166,20 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         };
         let policy = WorkflowPolicy::new(target.workflow.clone());
         let action = policy.decide_next_action(&view);
+        let store_key = StoreItemKey::new(&target.owner, &target.repo, &item.id);
         match action {
             WorkflowAction::Ignore
             | WorkflowAction::WaitForStart
             | WorkflowAction::WaitForReview => Ok(()),
             WorkflowAction::Triage => {
-                self.triage(target, &item, &content, &thread, latest_human_comment_id)
-                    .await
+                self.triage(TriageRequest {
+                    target,
+                    item: &item,
+                    content: &content,
+                    thread: &thread,
+                    latest_comment_id: latest_human_comment_id,
+                })
+                .await
             }
             WorkflowAction::StartWork => {
                 self.start_or_continue_work(WorkRequest {
@@ -182,16 +206,10 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                 .await
             }
             WorkflowAction::WaitForMerge => {
-                self.store.mark_review_handled(
-                    &target.owner,
-                    &target.repo,
-                    &item.id,
-                    latest_review_id,
-                )?;
+                self.store
+                    .mark_review_handled(store_key, latest_review_id)?;
                 self.store.mark_state(
-                    &target.owner,
-                    &target.repo,
-                    &item.id,
+                    store_key,
                     ManagedState::ReviewPending,
                     latest_human_comment_id,
                 )?;
@@ -231,45 +249,57 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         }))
     }
 
-    async fn triage(
-        &self,
-        target: &TargetConfig,
-        item: &ProjectItem,
-        content: &ProjectContent,
-        thread: &CommentThread,
-        latest_comment_id: Option<i64>,
-    ) -> Result<()> {
-        let discussion = self.comment_composer.discussion_text(thread.comments());
-        let prompt = TriagePrompt::new(&content.title, &content.body, &discussion).render();
+    async fn triage(&self, request: TriageRequest<'_>) -> Result<()> {
+        let discussion = self
+            .comment_composer
+            .discussion_text(request.thread.comments());
+        let prompt =
+            TriagePrompt::new(&request.content.title, &request.content.body, &discussion).render();
         let result = self
             .runner
-            .triage(&target.commands, &target.checkout_path, &prompt)
+            .triage(
+                &request.target.commands,
+                &request.target.checkout_path,
+                &prompt,
+            )
             .await?;
-        let (state, body) =
-            self.comment_composer
-                .triage_comment(item, &result, &target.workflow.start_status);
+        let (state, body) = self.comment_composer.triage_comment(
+            request.item,
+            &result,
+            &request.target.workflow.start_status,
+        );
         self.github
-            .create_issue_comment(target, content.number, &body)
+            .create_issue_comment(request.target, request.content.number, &body)
             .await?;
         match state {
             ManagedState::AwaitingStart => {
                 self.github
-                    .set_project_status(target, item, &target.workflow.triaged_status)
+                    .set_project_status(
+                        request.target,
+                        request.item,
+                        &request.target.workflow.triaged_status,
+                    )
                     .await?;
             }
             ManagedState::Blocked => {
                 self.github
-                    .set_project_status(target, item, &target.workflow.blocked_status)
+                    .set_project_status(
+                        request.target,
+                        request.item,
+                        &request.target.workflow.blocked_status,
+                    )
                     .await?;
             }
             _ => {}
         }
         self.store.mark_state(
-            &target.owner,
-            &target.repo,
-            &item.id,
+            StoreItemKey::new(
+                &request.target.owner,
+                &request.target.repo,
+                &request.item.id,
+            ),
             state,
-            latest_comment_id,
+            request.latest_comment_id,
         )?;
         Ok(())
     }
@@ -290,10 +320,9 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         self.workspace
             .ensure_worktree(work.target, &identity)
             .await?;
+        let store_key = StoreItemKey::new(&work.target.owner, &work.target.repo, &work.item.id);
         self.store.attach_work(
-            &work.target.owner,
-            &work.target.repo,
-            &work.item.id,
+            store_key,
             &identity.branch,
             &identity.worktree_path.to_string_lossy(),
         )?;
@@ -346,9 +375,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                 .set_project_status(work.target, work.item, &work.target.workflow.blocked_status)
                 .await?;
             self.store.mark_state(
-                &work.target.owner,
-                &work.target.repo,
-                &work.item.id,
+                store_key,
                 ManagedState::Blocked,
                 work.thread
                     .comments()
@@ -394,9 +421,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     )
                     .await?;
                 self.store.mark_state(
-                    &work.target.owner,
-                    &work.target.repo,
-                    &work.item.id,
+                    store_key,
                     ManagedState::Blocked,
                     work.thread
                         .comments()
@@ -425,26 +450,15 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                 pr
             }
         };
-        self.store.attach_pr(
-            &work.target.owner,
-            &work.target.repo,
-            &work.item.id,
-            pr.number,
-        )?;
+        self.store.attach_pr(store_key, pr.number)?;
         self.store.mark_state(
-            &work.target.owner,
-            &work.target.repo,
-            &work.item.id,
+            store_key,
             work.post_work_state,
             work.thread.latest_human_comment_id(&self.config.bot_login),
         )?;
         if work.post_work_state == ManagedState::ReviewPending {
-            self.store.mark_review_handled(
-                &work.target.owner,
-                &work.target.repo,
-                &work.item.id,
-                work.handled_review_id,
-            )?;
+            self.store
+                .mark_review_handled(store_key, work.handled_review_id)?;
         }
         self.github
             .set_project_status(work.target, work.item, &work.target.workflow.review_status)
@@ -469,9 +483,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             )
             .await?;
         self.store.mark_state(
-            &target.owner,
-            &target.repo,
-            &item.id,
+            StoreItemKey::new(&target.owner, &target.repo, &item.id),
             ManagedState::Done,
             None,
         )?;

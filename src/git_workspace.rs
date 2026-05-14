@@ -5,9 +5,13 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
+use tokio::time::{self, Duration};
 
 use crate::config::TargetConfig;
 use crate::error::{Error, OptionContext, Result, ResultContext};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const ERROR_OUTPUT_LIMIT: usize = 12_000;
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -203,7 +207,8 @@ impl CommandRunner {
             .args(args)
             .current_dir(&self.working_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         } else {
@@ -212,15 +217,20 @@ impl CommandRunner {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn {program}"))?;
-        if let Some(stdin) = stdin {
-            let mut child_stdin = child.stdin.take().context("failed to open child stdin")?;
-            use tokio::io::AsyncWriteExt;
-            child_stdin.write_all(stdin.as_bytes()).await?;
-        }
-        let output = child
-            .wait_with_output()
-            .await
-            .with_context(|| format!("failed to wait for {program}"))?;
+        let output = time::timeout(COMMAND_TIMEOUT, async {
+            if let Some(stdin) = stdin {
+                let mut child_stdin = child.stdin.take().context("failed to open child stdin")?;
+                use tokio::io::AsyncWriteExt;
+                child_stdin.write_all(stdin.as_bytes()).await?;
+                child_stdin.shutdown().await?;
+            }
+            child
+                .wait_with_output()
+                .await
+                .with_context(|| format!("failed to wait for {program}"))
+        })
+        .await
+        .map_err(|_| Error::timeout(format!("{program} exceeded 3600 seconds")))??;
         Ok(CommandOutput {
             status_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -241,10 +251,27 @@ impl CommandOutput {
         } else {
             Err(Error::message(format!(
                 "{label} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-                self.status_code, self.stdout, self.stderr
+                self.status_code,
+                truncate_output(&self.stdout, ERROR_OUTPUT_LIMIT),
+                truncate_output(&self.stderr, ERROR_OUTPUT_LIMIT)
             )))
         }
     }
+}
+
+fn truncate_output(input: &str, limit: usize) -> String {
+    if input.len() <= limit {
+        return input.to_string();
+    }
+    let note = format!("\n[truncated {} bytes]", input.len() - limit);
+    let body_limit = limit.saturating_sub(note.len());
+    let end = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= body_limit)
+        .last()
+        .unwrap_or(0);
+    format!("{}{}", &input[..end], note)
 }
 
 #[cfg(test)]

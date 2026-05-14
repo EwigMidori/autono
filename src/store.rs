@@ -31,6 +31,14 @@ pub struct StoredItem {
     pub updated_at: OffsetDateTime,
 }
 
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreItemKey<'a> {
+    pub(crate) owner: &'a str,
+    pub(crate) repo: &'a str,
+    pub(crate) item_id: &'a str,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -57,7 +65,7 @@ impl Store {
             .context("failed to load stored item")
     }
 
-    pub fn upsert_item(&self, item: &StoredItem) -> Result<()> {
+    pub(crate) fn upsert_item(&self, item: &StoredItem) -> Result<()> {
         self.conn.execute(
             "insert into items
              (owner, repo, item_id, state, branch, worktree_path, pr_number, last_comment_id, last_review_id, updated_at)
@@ -86,19 +94,17 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_state(
+    pub(crate) fn mark_state(
         &self,
-        owner: &str,
-        repo: &str,
-        item_id: &str,
+        key: StoreItemKey<'_>,
         state: ManagedState,
         last_comment_id: Option<i64>,
     ) -> Result<StoredItem> {
-        let existing = self.get_item(owner, repo, item_id)?;
+        let existing = self.get_item(key.owner, key.repo, key.item_id)?;
         let mut item = existing.unwrap_or_else(|| StoredItem {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            item_id: item_id.to_string(),
+            owner: key.owner.to_string(),
+            repo: key.repo.to_string(),
+            item_id: key.item_id.to_string(),
             state,
             branch: None,
             worktree_path: None,
@@ -116,17 +122,17 @@ impl Store {
         Ok(item)
     }
 
-    pub fn attach_work(
+    pub(crate) fn attach_work(
         &self,
-        owner: &str,
-        repo: &str,
-        item_id: &str,
+        key: StoreItemKey<'_>,
         branch: &str,
         worktree_path: &str,
     ) -> Result<StoredItem> {
         let mut item = self
-            .get_item(owner, repo, item_id)?
-            .unwrap_or_else(|| StoredItem::new(owner, repo, item_id, ManagedState::Working));
+            .get_item(key.owner, key.repo, key.item_id)?
+            .unwrap_or_else(|| {
+                StoredItem::new(key.owner, key.repo, key.item_id, ManagedState::Working)
+            });
         item.state = ManagedState::Working;
         item.branch = Some(branch.to_string());
         item.worktree_path = Some(worktree_path.to_string());
@@ -135,16 +141,12 @@ impl Store {
         Ok(item)
     }
 
-    pub fn attach_pr(
-        &self,
-        owner: &str,
-        repo: &str,
-        item_id: &str,
-        pr_number: i64,
-    ) -> Result<StoredItem> {
+    pub(crate) fn attach_pr(&self, key: StoreItemKey<'_>, pr_number: i64) -> Result<StoredItem> {
         let mut item = self
-            .get_item(owner, repo, item_id)?
-            .unwrap_or_else(|| StoredItem::new(owner, repo, item_id, ManagedState::PrOpen));
+            .get_item(key.owner, key.repo, key.item_id)?
+            .unwrap_or_else(|| {
+                StoredItem::new(key.owner, key.repo, key.item_id, ManagedState::PrOpen)
+            });
         item.state = ManagedState::PrOpen;
         item.pr_number = Some(pr_number);
         item.updated_at = OffsetDateTime::now_utc();
@@ -152,16 +154,21 @@ impl Store {
         Ok(item)
     }
 
-    pub fn mark_review_handled(
+    pub(crate) fn mark_review_handled(
         &self,
-        owner: &str,
-        repo: &str,
-        item_id: &str,
+        key: StoreItemKey<'_>,
         review_id: Option<i64>,
     ) -> Result<StoredItem> {
         let mut item = self
-            .get_item(owner, repo, item_id)?
-            .unwrap_or_else(|| StoredItem::new(owner, repo, item_id, ManagedState::ReviewPending));
+            .get_item(key.owner, key.repo, key.item_id)?
+            .unwrap_or_else(|| {
+                StoredItem::new(
+                    key.owner,
+                    key.repo,
+                    key.item_id,
+                    ManagedState::ReviewPending,
+                )
+            });
         item.last_review_id = review_id;
         item.updated_at = OffsetDateTime::now_utc();
         self.upsert_item(&item)?;
@@ -239,6 +246,16 @@ impl StoredItem {
             last_review_id: row.get(8)?,
             updated_at,
         })
+    }
+}
+
+impl<'a> StoreItemKey<'a> {
+    pub(crate) fn new(owner: &'a str, repo: &'a str, item_id: &'a str) -> Self {
+        Self {
+            owner,
+            repo,
+            item_id,
+        }
     }
 }
 

@@ -5,6 +5,8 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result, ResultContext};
 
+const MAX_FIX_ATTEMPTS: usize = 10;
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -109,6 +111,9 @@ impl Config {
         if self.bot_login.trim().is_empty() {
             return Err(Error::message("bot_login must not be empty"));
         }
+        if self.poll_interval_secs == 0 {
+            return Err(Error::message("poll_interval_secs must be greater than 0"));
+        }
         if self.targets.is_empty() {
             return Err(Error::message("at least one [[targets]] entry is required"));
         }
@@ -178,6 +183,13 @@ impl TargetConfig {
             return Err(Error::message(format!(
                 "target {} commands.codex must not be empty",
                 self.full_name()
+            )));
+        }
+        if self.commands.max_fix_attempts > MAX_FIX_ATTEMPTS {
+            return Err(Error::message(format!(
+                "target {} commands.max_fix_attempts must be <= {}",
+                self.full_name(),
+                MAX_FIX_ATTEMPTS
             )));
         }
         if self.workflow.status_field.trim().is_empty()
@@ -278,5 +290,63 @@ mod serde_defaults {
 
     pub(super) fn max_fix_attempts() -> usize {
         3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_target() -> TargetConfig {
+        TargetConfig {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            checkout_path: "/tmp/repo".into(),
+            base_branch: "main".to_string(),
+            project_owner: None,
+            project_id: Some("PVT_test".to_string()),
+            project_number: None,
+            workflow: WorkflowConfig {
+                status_field: "Status".to_string(),
+                triaged_status: "Triaged".to_string(),
+                start_status: "In Progress".to_string(),
+                review_status: "In Review".to_string(),
+                done_status: "Done".to_string(),
+                blocked_status: "Blocked".to_string(),
+            },
+            review: ReviewConfig::default(),
+            commands: CommandsConfig {
+                codex: vec!["codex".to_string()],
+                test: Vec::new(),
+                max_fix_attempts: 3,
+            },
+        }
+    }
+
+    fn valid_config() -> Config {
+        Config {
+            bot_login: "bot".to_string(),
+            poll_interval_secs: 60,
+            worktrees_root: "/tmp/worktrees".into(),
+            state_path: None,
+            github: GitHubConfig::default(),
+            targets: vec![valid_target()],
+        }
+    }
+
+    #[test]
+    fn rejects_zero_poll_interval() {
+        let mut config = valid_config();
+        config.poll_interval_secs = 0;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_fix_attempts() {
+        let mut config = valid_config();
+        config.targets[0].commands.max_fix_attempts = MAX_FIX_ATTEMPTS + 1;
+
+        assert!(config.validate().is_err());
     }
 }

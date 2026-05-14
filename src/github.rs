@@ -18,6 +18,9 @@ use crate::github_types::{
 };
 use crate::workflow::{CommentView, ReviewDecision};
 
+const MAX_GRAPHQL_PAGES: usize = 100;
+const MAX_REST_PAGES: usize = 100;
+
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
@@ -249,7 +252,7 @@ impl GitHubClient {
             target.owner, target.repo, pr_number
         );
         let mut reviews = Vec::new();
-        let mut page = 1;
+        let mut page = 1usize;
         loop {
             let batch: Vec<ReviewResponse> = self
                 .rest_get_query(
@@ -261,6 +264,11 @@ impl GitHubClient {
             reviews.extend(batch);
             if done {
                 break;
+            }
+            if page >= MAX_REST_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {path}"
+                )));
             }
             page += 1;
         }
@@ -308,7 +316,14 @@ impl GitHub for GitHubClient {
         };
         let mut items = Vec::new();
         let mut after: Option<String> = None;
+        let mut page_count = 0usize;
         loop {
+            page_count += 1;
+            if page_count > MAX_GRAPHQL_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub GraphQL pagination exceeded {MAX_GRAPHQL_PAGES} pages for project items"
+                )));
+            }
             let data: ProjectItemsResponse = self
                 .graphql(
                     PROJECT_ITEMS_QUERY,
@@ -316,15 +331,23 @@ impl GitHub for GitHubClient {
                 )
                 .await?;
             let page = data.node.items;
+            let has_next_page = page.page_info.has_next_page;
+            let next_after = page.page_info.end_cursor.clone();
             items.extend(
                 page.nodes
                     .into_iter()
                     .filter_map(|node| node.into_project_item(&target.workflow.status_field)),
             );
-            if !page.page_info.has_next_page {
+            if !has_next_page {
                 break;
             }
-            after = page.page_info.end_cursor;
+            let next_after = next_after.context("project item page had no end cursor")?;
+            if after.as_deref() == Some(next_after.as_str()) {
+                return Err(Error::message(
+                    "GitHub project item pagination cursor did not advance",
+                ));
+            }
+            after = Some(next_after);
         }
         Ok(items)
     }
@@ -345,7 +368,7 @@ impl GitHub for GitHubClient {
             "/repos/{}/{}/issues/{}/comments",
             target.owner, target.repo, content.number
         );
-        let mut page = 1;
+        let mut page = 1usize;
         loop {
             let rest_comments: Vec<IssueCommentResponse> = self
                 .rest_get_query(
@@ -362,6 +385,11 @@ impl GitHub for GitHubClient {
             }));
             if done {
                 break;
+            }
+            if page >= MAX_REST_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {path}"
+                )));
             }
             page += 1;
         }

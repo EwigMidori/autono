@@ -5,6 +5,8 @@ use std::error::Error as StdError;
 pub enum Error {
     #[error("{0}")]
     Message(String),
+    #[error("timeout: {0}")]
+    Timeout(String),
     #[error("{context}: {source}")]
     Context {
         context: String,
@@ -38,6 +40,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     pub fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
+    }
+
+    pub fn timeout(context: impl Into<String>) -> Self {
+        Self::Timeout(context.into())
     }
 }
 

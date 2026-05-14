@@ -7,6 +7,9 @@ use crate::error::{OptionContext, Result, ResultContext};
 use crate::git_workspace::{CommandOutput, CommandRunner};
 use crate::workflow::TriageResult;
 
+const PROMPT_SECTION_LIMIT: usize = 24_000;
+const VALIDATION_OUTPUT_PROMPT_LIMIT: usize = 12_000;
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct CodexRunner;
@@ -135,6 +138,9 @@ impl TriagePrompt {
     }
 
     pub(crate) fn render(&self) -> String {
+        let title = truncate_end(&self.title, PROMPT_SECTION_LIMIT);
+        let body = truncate_end(&self.body, PROMPT_SECTION_LIMIT);
+        let comments = truncate_end(&self.comments, PROMPT_SECTION_LIMIT);
         format!(
             r#"You are triaging a GitHub project item for an autonomous coding daemon.
 
@@ -155,7 +161,7 @@ Body:
 Discussion:
 {}
 "#,
-            self.title, self.body, self.comments
+            title, body, comments
         )
     }
 }
@@ -170,6 +176,13 @@ impl ImplementationPrompt {
     }
 
     pub(crate) fn render(&self) -> String {
+        let summary = truncate_end(&self.summary, PROMPT_SECTION_LIMIT);
+        let discussion = truncate_end(&self.discussion, PROMPT_SECTION_LIMIT);
+        let tests = if self.tests.is_empty() {
+            "(none configured)".to_string()
+        } else {
+            truncate_end(&self.tests.join("\n"), PROMPT_SECTION_LIMIT)
+        };
         format!(
             r#"Implement this GitHub task in the current repository worktree.
 
@@ -183,23 +196,47 @@ After editing, make commits unnecessary; the daemon will commit all changes.
 Expected validation commands:
 {}
 "#,
-            self.summary,
-            self.discussion,
-            if self.tests.is_empty() {
-                "(none configured)".to_string()
-            } else {
-                self.tests.join("\n")
-            }
+            summary, discussion, tests
         )
     }
 
     pub(crate) fn render_repair(&self, validation_output: &str) -> String {
+        let validation_output = truncate_start(validation_output, VALIDATION_OUTPUT_PROMPT_LIMIT);
         format!(
             "{}\n\nThe previous validation failed. Fix the repository based on this output:\n{}",
             self.render(),
             validation_output
         )
     }
+}
+
+fn truncate_end(input: &str, limit: usize) -> String {
+    if input.len() <= limit {
+        return input.to_string();
+    }
+    let note = format!("\n[truncated {} bytes]", input.len() - limit);
+    let body_limit = limit.saturating_sub(note.len());
+    let end = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= body_limit)
+        .last()
+        .unwrap_or(0);
+    format!("{}{}", &input[..end], note)
+}
+
+fn truncate_start(input: &str, limit: usize) -> String {
+    if input.len() <= limit {
+        return input.to_string();
+    }
+    let note = format!("[truncated {} bytes]\n", input.len() - limit);
+    let body_limit = limit.saturating_sub(note.len());
+    let start = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| input.len() - *index <= body_limit)
+        .unwrap_or(input.len());
+    format!("{}{}", note, &input[start..])
 }
 
 impl ValidationRunner {
@@ -253,5 +290,17 @@ mod tests {
             serde_json::from_str(CodexRunner.json_object(text).unwrap()).unwrap();
         assert!(parsed.is_code_change);
         assert_eq!(parsed.summary, "x");
+    }
+
+    #[test]
+    fn repair_prompt_truncates_large_validation_output_from_start() {
+        let prompt = ImplementationPrompt::new("summary", "discussion", &[]);
+        let validation_output = format!("{}tail", "a".repeat(VALIDATION_OUTPUT_PROMPT_LIMIT + 100));
+
+        let rendered = prompt.render_repair(&validation_output);
+
+        assert!(rendered.contains("[truncated"));
+        assert!(rendered.contains("tail"));
+        assert!(rendered.len() < prompt.render().len() + validation_output.len());
     }
 }
