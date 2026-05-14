@@ -1,10 +1,10 @@
 [workspace]
-pr_labels = ["release"]
-pr_name = "release-plz"
+changelog_update = true
+publish = true
+dependencies_update = true
+semver_check = true
+release_always = false
 
-[package]
-release = true
-publish = false
-
-[git]
-require_conventional = true
+[[package]]
+name = "autono"
+changelog_path = "CHANGELOG.md"
