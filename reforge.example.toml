@@ -1,0 +1,33 @@
+bot_login = "your-bot-login"
+poll_interval_secs = 60
+worktrees_root = "/srv/reforge/worktrees"
+state_path = "/srv/reforge/state.sqlite3"
+
+[github]
+token_source = "gh"
+api_url = "https://api.github.com"
+graphql_url = "https://api.github.com/graphql"
+
+[[targets]]
+owner = "example"
+repo = "service-a"
+checkout_path = "/srv/reforge/checkouts/service-a"
+base_branch = "main"
+project_owner = "example"
+project_number = 12
+
+[targets.workflow]
+status_field = "Status"
+triaged_status = "Triaged"
+start_status = "In Progress"
+review_status = "In Review"
+done_status = "Done"
+blocked_status = "Blocked"
+
+[targets.review]
+reviewers = ["alice", "bob"]
+
+[targets.commands]
+codex = ["codex"]
+test = ["cargo test"]
+max_fix_attempts = 3
