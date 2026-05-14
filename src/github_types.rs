@@ -1,14 +1,9 @@
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::github::{ProjectContent, ProjectContentKind, ProjectItem};
-
-#[non_exhaustive]
-#[derive(Debug, Deserialize)]
-pub(crate) struct GraphQlEnvelope<T> {
-    pub(crate) data: Option<T>,
-    pub(crate) errors: Option<Vec<serde_json::Value>>,
-}
+use crate::github::{
+    ProjectContent, ProjectContentKind, ProjectItem, ReviewThread, ReviewThreadComment,
+};
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
@@ -215,58 +210,92 @@ pub(crate) struct ProjectFieldOption {
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct IssueCommentResponse {
-    pub(crate) id: i64,
-    pub(crate) body: String,
-    pub(crate) user: UserResponse,
-    #[serde(with = "time::serde::rfc3339")]
-    pub(crate) created_at: OffsetDateTime,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Deserialize)]
 pub(crate) struct UserResponse {
     pub(crate) login: String,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct PermissionResponse {
-    pub(crate) permission: String,
+pub(crate) struct PullRequestReviewThreadsResponse {
+    pub(crate) repository: Option<ReviewThreadRepositoryNode>,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct PullResponse {
-    pub(crate) number: i64,
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub(crate) merged_at: Option<OffsetDateTime>,
+pub(crate) struct ReviewThreadRepositoryNode {
+    #[serde(rename = "pullRequest")]
+    pub(crate) pull_request: Option<ReviewThreadPullRequestNode>,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct ReviewResponse {
-    pub(crate) id: i64,
-    pub(crate) state: String,
+pub(crate) struct ReviewThreadPullRequestNode {
+    #[serde(rename = "reviewThreads")]
+    pub(crate) review_threads: ReviewThreadConnection,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct PullRequestReviewCommentResponse {
-    pub(crate) id: i64,
-    #[serde(default)]
-    pub(crate) pull_request_review_id: Option<i64>,
-    pub(crate) body: String,
-    pub(crate) user: UserResponse,
+pub(crate) struct ReviewThreadConnection {
+    pub(crate) nodes: Vec<ReviewThreadNode>,
+    #[serde(rename = "pageInfo")]
+    pub(crate) page_info: PageInfo,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReviewThreadNode {
+    pub(crate) id: String,
+    #[serde(rename = "isResolved")]
+    pub(crate) is_resolved: bool,
+    #[serde(rename = "isOutdated")]
+    pub(crate) is_outdated: bool,
     pub(crate) path: String,
     #[serde(default)]
     pub(crate) line: Option<i64>,
     #[serde(default)]
     pub(crate) original_line: Option<i64>,
-    #[serde(default)]
+    pub(crate) comments: ReviewThreadCommentConnection,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReviewThreadCommentConnection {
+    pub(crate) nodes: Vec<ReviewThreadCommentNode>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReviewThreadCommentNode {
+    pub(crate) author: Option<UserResponse>,
+    pub(crate) body: String,
+    #[serde(rename = "diffHunk", default)]
     pub(crate) diff_hunk: String,
-    #[serde(default)]
-    pub(crate) html_url: String,
+    pub(crate) url: String,
+}
+
+impl ReviewThreadNode {
+    pub(crate) fn into_review_thread(self) -> ReviewThread {
+        ReviewThread {
+            id: self.id,
+            is_resolved: self.is_resolved,
+            is_outdated: self.is_outdated,
+            path: self.path,
+            line: self.line,
+            original_line: self.original_line,
+            comments: self
+                .comments
+                .nodes
+                .into_iter()
+                .map(|comment| ReviewThreadComment {
+                    author: comment.author.map(|user| user.login).unwrap_or_default(),
+                    body: comment.body,
+                    diff_hunk: comment.diff_hunk,
+                    html_url: comment.url,
+                })
+                .collect(),
+        }
+    }
 }
 
 pub(crate) const RESOLVE_PROJECT_QUERY: &str = r#"
@@ -331,6 +360,34 @@ mutation UpdateProjectStatus($projectId: ID!, $itemId: ID!, $fieldId: ID!, $opti
     value: { singleSelectOptionId: $optionId }
   }) {
     projectV2Item { id }
+  }
+}
+"#;
+
+pub(crate) const REVIEW_THREADS_QUERY: &str = r#"
+query PullRequestReviewThreads($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          comments(first: 100) {
+            nodes {
+              author { login }
+              body
+              diffHunk
+              url
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
   }
 }
 "#;

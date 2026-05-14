@@ -38,6 +38,7 @@ struct WorkRequest<'a> {
     stored: Option<StoredItem>,
     post_work_state: ManagedState,
     handled_review_id: Option<i64>,
+    review_body: Option<String>,
     pr_number: Option<i64>,
 }
 
@@ -161,6 +162,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             None => None,
         };
         let latest_review_id = pr.as_ref().and_then(|pr| pr.latest_review_id);
+        let latest_review_body = pr.as_ref().and_then(|pr| pr.latest_review_body.clone());
         let pr_number = pr
             .as_ref()
             .map(|pr| pr.number)
@@ -207,6 +209,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     stored,
                     post_work_state: ManagedState::PrOpen,
                     handled_review_id: None,
+                    review_body: None,
                     pr_number,
                 })
                 .await
@@ -220,6 +223,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     stored,
                     post_work_state: ManagedState::ReviewPending,
                     handled_review_id: latest_review_id,
+                    review_body: latest_review_body,
                     pr_number,
                 })
                 .await
@@ -348,7 +352,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             work.target,
             work.post_work_state,
             work.pr_number,
-            work.handled_review_id,
+            work.review_body.as_deref(),
         );
         let review_feedback = feedback
             .trusted_feedback_for_state(&self.github, feedback_request)

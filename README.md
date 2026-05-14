@@ -78,7 +78,7 @@ Autono first confirms the request, then moves through implementation phases.
    - After validation passes, Autono commits and pushes the changes
    - It creates or reuses a PR
    - It requests reviewers
-   - If review requests changes, Autono continues on the same branch and worktree
+   - If review requests changes, Autono continues on the same branch and worktree, replies to active review threads, and resolves them after the fix lands
 
 6. **Complete**
    - After a human merges the PR, Autono marks the item complete
@@ -182,7 +182,7 @@ blocked_status = "Blocked"
 reviewers = ["alice", "bob"]
 
 [targets.commands]
-codex = ["codex"]
+codex = ["codex", "exec", "--sandbox", "danger-full-access", "--ask-for-approval", "never"]
 test = ["cargo", "test"]
 max_fix_attempts = 3
 ```

@@ -285,7 +285,14 @@ mod serde_defaults {
     }
 
     pub(super) fn codex_command() -> Vec<String> {
-        vec!["codex".to_string()]
+        vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+        ]
     }
 
     pub(super) fn max_fix_attempts() -> usize {
@@ -316,7 +323,7 @@ mod tests {
             },
             review: ReviewConfig::default(),
             commands: CommandsConfig {
-                codex: vec!["codex".to_string()],
+                codex: serde_defaults::codex_command(),
                 test: Vec::new(),
                 max_fix_attempts: 3,
             },

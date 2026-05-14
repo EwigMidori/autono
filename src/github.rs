@@ -1,9 +1,11 @@
+use std::convert::TryFrom;
 use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
-use reqwest::StatusCode;
+use octocrab::models::pulls;
+use octocrab::params;
+use octocrab::{GraphqlResponse, Octocrab, Page};
 use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
@@ -13,10 +15,9 @@ use tokio::time as tokio_time;
 use crate::config::{GitHubConfig, TargetConfig, TokenSource};
 use crate::error::{Error, OptionContext, Result, ResultContext};
 use crate::github_types::{
-    GraphQlEnvelope, IssueCommentResponse, PermissionResponse, ProjectFieldsResponse,
-    ProjectItemsResponse, PullRequestReviewCommentResponse, PullResponse, ResolveProjectResponse,
-    ReviewResponse, PROJECT_FIELDS_QUERY, PROJECT_ITEMS_QUERY, RESOLVE_PROJECT_QUERY,
-    UPDATE_PROJECT_FIELD_MUTATION,
+    ProjectFieldsResponse, ProjectItemsResponse, PullRequestReviewThreadsResponse,
+    ResolveProjectResponse, PROJECT_FIELDS_QUERY, PROJECT_ITEMS_QUERY, RESOLVE_PROJECT_QUERY,
+    REVIEW_THREADS_QUERY, UPDATE_PROJECT_FIELD_MUTATION,
 };
 use crate::workflow::{CommentView, ReviewDecision};
 
@@ -29,8 +30,7 @@ const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
-    rest: reqwest::Client,
-    api_url: String,
+    octo: Octocrab,
     graphql_url: String,
 }
 
@@ -70,6 +70,7 @@ pub struct PullRequestInfo {
     pub merged: bool,
     pub review_decision: ReviewDecision,
     pub latest_review_id: Option<i64>,
+    pub latest_review_body: Option<String>,
 }
 
 #[non_exhaustive]
@@ -83,14 +84,21 @@ pub struct NewPullRequest {
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-pub struct ReviewComment {
-    pub id: i64,
-    pub review_id: Option<i64>,
-    pub author: String,
-    pub body: String,
+pub struct ReviewThread {
+    pub id: String,
+    pub is_resolved: bool,
+    pub is_outdated: bool,
     pub path: String,
     pub line: Option<i64>,
     pub original_line: Option<i64>,
+    pub comments: Vec<ReviewThreadComment>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ReviewThreadComment {
+    pub author: String,
+    pub body: String,
     pub diff_hunk: String,
     pub html_url: String,
 }
@@ -136,11 +144,11 @@ pub trait GitHub: Send + Sync {
         pr_number: i64,
         reviewers: &[String],
     ) -> Result<()>;
-    async fn list_review_comments(
+    async fn list_review_threads(
         &self,
         target: &TargetConfig,
         pr_number: i64,
-    ) -> Result<Vec<ReviewComment>>;
+    ) -> Result<Vec<ReviewThread>>;
 }
 
 impl GitHubClient {
@@ -148,31 +156,17 @@ impl GitHubClient {
         let token = GitHubAuthenticator::new(&config.token_source)
             .token()
             .await?;
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static("autono"));
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/vnd.github+json"),
-        );
-        headers.insert(
-            "X-GitHub-Api-Version",
-            HeaderValue::from_static("2022-11-28"),
-        );
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("failed to build authorization header")?,
-        );
-        let rest = reqwest::Client::builder()
-            .default_headers(headers)
-            .connect_timeout(GITHUB_CONNECT_TIMEOUT)
-            .timeout(GITHUB_REQUEST_TIMEOUT)
+        let octo = Octocrab::builder()
+            .base_uri(config.api_url.trim_end_matches('/'))?
+            .personal_token(token)
+            .set_connect_timeout(Some(GITHUB_CONNECT_TIMEOUT))
+            .set_read_timeout(Some(GITHUB_REQUEST_TIMEOUT))
+            .set_write_timeout(Some(GITHUB_REQUEST_TIMEOUT))
             .build()
-            .context("failed to build GitHub HTTP client")?;
+            .context("failed to build GitHub client")?;
         Ok(Self {
-            rest,
-            api_url: config.api_url.trim_end_matches('/').to_string(),
-            graphql_url: config.graphql_url.clone(),
+            octo,
+            graphql_url: config.graphql_url.trim_end_matches('/').to_string(),
         })
     }
 
@@ -181,153 +175,110 @@ impl GitHubClient {
         query: &str,
         variables: serde_json::Value,
     ) -> Result<T> {
-        let response = self
-            .rest
-            .post(&self.graphql_url)
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
+        let response: GraphqlResponse<T> = self
+            .octo
+            .post(
+                &self.graphql_url,
+                Some(&json!({ "query": query, "variables": variables })),
+            )
             .await
-            .context("failed to call GitHub GraphQL")?
-            .error_for_status()
-            .context("GitHub GraphQL returned an error status")?;
-        let envelope: GraphQlEnvelope<T> = response.json().await.context("invalid GraphQL JSON")?;
-        if let Some(errors) = envelope.errors {
-            return Err(Error::message(format!(
+            .context("failed to call GitHub GraphQL")?;
+        match response {
+            GraphqlResponse::Ok(ok) => Ok(ok.data),
+            GraphqlResponse::Err(err) => Err(Error::message(format!(
                 "GitHub GraphQL errors: {}",
-                serde_json::to_string(&errors)?
-            )));
+                serde_json::to_string(&err.errors)?
+            ))),
         }
-        envelope.data.context("GitHub GraphQL response had no data")
     }
 
-    async fn rest_get_query<T: for<'de> Deserialize<'de>>(
+    async fn collect_pages<T: serde::de::DeserializeOwned>(
         &self,
-        path: &str,
-        query: &[(&str, String)],
-    ) -> Result<T> {
-        self.rest
-            .get(format!("{}{}", self.api_url, path))
-            .query(query)
-            .send()
-            .await
-            .with_context(|| format!("failed to GET {path}"))?
-            .error_for_status()
-            .with_context(|| format!("GitHub GET {path} failed"))?
-            .json()
-            .await
-            .with_context(|| format!("invalid JSON from {path}"))
-    }
-
-    async fn rest_get_optional<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &str,
-    ) -> Result<Option<T>> {
-        let response = self
-            .rest
-            .get(format!("{}{}", self.api_url, path))
-            .send()
-            .await
-            .with_context(|| format!("failed to GET {path}"))?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
+        mut page: Page<T>,
+        resource: &str,
+    ) -> Result<Vec<T>> {
+        let mut items = page.take_items();
+        let mut page_count = 1usize;
+        while let Some(mut next_page) = self.octo.get_page(&page.next).await? {
+            page_count += 1;
+            if page_count > MAX_REST_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {resource}"
+                )));
+            }
+            items.append(&mut next_page.take_items());
+            page = next_page;
         }
-        response
-            .error_for_status()
-            .with_context(|| format!("GitHub GET {path} failed"))?
-            .json()
-            .await
-            .map(Some)
-            .with_context(|| format!("invalid JSON from {path}"))
-    }
-
-    async fn rest_post<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &str,
-        payload: serde_json::Value,
-    ) -> Result<T> {
-        self.rest
-            .post(format!("{}{}", self.api_url, path))
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("failed to POST {path}"))?
-            .error_for_status()
-            .with_context(|| format!("GitHub POST {path} failed"))?
-            .json()
-            .await
-            .with_context(|| format!("invalid JSON from {path}"))
+        Ok(items)
     }
 
     async fn pull_info(
         &self,
         target: &TargetConfig,
-        pull: PullResponse,
+        pull: pulls::PullRequest,
     ) -> Result<PullRequestInfo> {
-        let review_decision = self.review_decision(target, pull.number).await?;
+        let review_state = self.review_state(target, pull.number).await?;
         Ok(PullRequestInfo {
-            number: pull.number,
-            merged: pull.merged_at.is_some(),
-            review_decision: review_decision.decision,
-            latest_review_id: review_decision.review_id,
+            number: github_id(pull.number)?,
+            merged: pull.merged,
+            review_decision: review_state.decision,
+            latest_review_id: review_state.review_id,
+            latest_review_body: review_state.review_body,
         })
     }
 
-    async fn review_decision(&self, target: &TargetConfig, pr_number: i64) -> Result<ReviewState> {
-        let path = format!(
-            "/repos/{}/{}/pulls/{}/reviews",
-            target.owner, target.repo, pr_number
-        );
-        let mut reviews = Vec::new();
-        let mut page = 1usize;
-        loop {
-            let batch: Vec<ReviewResponse> = self
-                .rest_get_query(
-                    &path,
-                    &[("per_page", "100".to_string()), ("page", page.to_string())],
+    async fn review_state(&self, target: &TargetConfig, pr_number: u64) -> Result<ReviewState> {
+        let page = self
+            .octo
+            .pulls(&target.owner, &target.repo)
+            .list_reviews(pr_number)
+            .per_page(100)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to list pull request reviews for {}/{}#{}",
+                    target.owner, target.repo, pr_number
                 )
-                .await?;
-            let done = batch.len() < 100;
-            reviews.extend(batch);
-            if done {
-                break;
-            }
-            if page >= MAX_REST_PAGES {
-                return Err(Error::message(format!(
-                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {path}"
-                )));
-            }
-            page += 1;
-        }
+            })?;
+        let reviews = self.collect_pages(page, "pull request reviews").await?;
         for review in reviews.iter().rev() {
-            match review.state.as_str() {
-                "CHANGES_REQUESTED" => {
+            match review.state {
+                Some(pulls::ReviewState::ChangesRequested) => {
                     return Ok(ReviewState::new(
                         ReviewDecision::ChangesRequested,
-                        Some(review.id),
+                        Some(github_id(review.id.into_inner())?),
+                        review.body.clone().filter(|body| !body.trim().is_empty()),
                     ));
                 }
-                "APPROVED" => {
-                    return Ok(ReviewState::new(ReviewDecision::Approved, Some(review.id)))
+                Some(pulls::ReviewState::Approved) => {
+                    return Ok(ReviewState::new(
+                        ReviewDecision::Approved,
+                        Some(github_id(review.id.into_inner())?),
+                        review.body.clone().filter(|body| !body.trim().is_empty()),
+                    ));
                 }
                 _ => {}
             }
         }
-        Ok(ReviewState::new(ReviewDecision::None, None))
+        Ok(ReviewState::new(ReviewDecision::None, None, None))
     }
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ReviewState {
     decision: ReviewDecision,
     review_id: Option<i64>,
+    review_body: Option<String>,
 }
 
 impl ReviewState {
-    fn new(decision: ReviewDecision, review_id: Option<i64>) -> Self {
+    fn new(decision: ReviewDecision, review_id: Option<i64>, review_body: Option<String>) -> Self {
         Self {
             decision,
             review_id,
+            review_body,
         }
     }
 }
@@ -394,31 +345,31 @@ impl GitHub for GitHubClient {
             "/repos/{}/{}/issues/{}/comments",
             target.owner, target.repo, content.number
         );
-        let mut page = 1usize;
-        loop {
-            let rest_comments: Vec<IssueCommentResponse> = self
-                .rest_get_query(
-                    &path,
-                    &[("per_page", "100".to_string()), ("page", page.to_string())],
-                )
-                .await?;
-            let done = rest_comments.len() < 100;
-            comments.extend(rest_comments.into_iter().map(|comment| CommentView {
-                id: comment.id,
-                author: comment.user.login,
-                body: comment.body,
-                created_at: comment.created_at,
-            }));
-            if done {
-                break;
-            }
-            if page >= MAX_REST_PAGES {
-                return Err(Error::message(format!(
-                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {path}"
-                )));
-            }
-            page += 1;
-        }
+        let page = self
+            .octo
+            .issues(&target.owner, &target.repo)
+            .list_comments(github_number(content.number)?)
+            .per_page(100)
+            .send()
+            .await
+            .with_context(|| format!("failed to list issue comments for {path}"))?;
+        let issue_comments = self.collect_pages(page, &path).await?;
+        comments.extend(
+            issue_comments
+                .into_iter()
+                .map(|comment| -> Result<CommentView> {
+                    Ok(CommentView {
+                        id: github_id(comment.id.into_inner())?,
+                        author: comment.user.login,
+                        body: comment.body.unwrap_or_default(),
+                        created_at: github_time(
+                            comment.created_at.timestamp(),
+                            comment.created_at.timestamp_subsec_nanos(),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
         Ok(comments)
     }
 
@@ -427,17 +378,22 @@ impl GitHub for GitHubClient {
         target: &TargetConfig,
         login: &str,
     ) -> Result<bool> {
-        let path = format!(
-            "/repos/{}/{}/collaborators/{}/permission",
-            target.owner, target.repo, login
-        );
-        let Some(response) = self.rest_get_optional::<PermissionResponse>(&path).await? else {
-            return Ok(false);
-        };
-        Ok(matches!(
-            response.permission.as_str(),
-            "admin" | "write" | "maintain"
-        ))
+        match self
+            .octo
+            .repos(&target.owner, &target.repo)
+            .get_contributor_permission(login)
+            .send()
+            .await
+        {
+            Ok(permission) => Ok(matches!(
+                permission.permission,
+                params::teams::Permission::Admin
+                    | params::teams::Permission::Push
+                    | params::teams::Permission::Maintain
+            )),
+            Err(err) if is_not_found(&err) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn create_issue_comment(
@@ -446,11 +402,16 @@ impl GitHub for GitHubClient {
         issue_number: i64,
         body: &str,
     ) -> Result<()> {
-        let path = format!(
-            "/repos/{}/{}/issues/{}/comments",
-            target.owner, target.repo, issue_number
-        );
-        let _: serde_json::Value = self.rest_post(&path, json!({ "body": body })).await?;
+        self.octo
+            .issues(&target.owner, &target.repo)
+            .create_comment(github_number(issue_number)?, body)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create issue comment for {}/{}#{}",
+                    target.owner, target.repo, issue_number
+                )
+            })?;
         Ok(())
     }
 
@@ -501,18 +462,22 @@ impl GitHub for GitHubClient {
         branch: &str,
     ) -> Result<Option<PullRequestInfo>> {
         let head = format!("{}:{branch}", target.owner);
-        let path = format!("/repos/{}/{}/pulls", target.owner, target.repo);
-        let prs: Vec<PullResponse> = self
-            .rest_get_query(
-                &path,
-                &[
-                    ("head", head),
-                    ("state", "all".to_string()),
-                    ("per_page", "10".to_string()),
-                ],
-            )
-            .await?;
-        match prs.into_iter().next() {
+        let mut page = self
+            .octo
+            .pulls(&target.owner, &target.repo)
+            .list()
+            .head(head)
+            .state(params::State::All)
+            .per_page(10)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to list pull requests for {}/{}",
+                    target.owner, target.repo
+                )
+            })?;
+        match page.take_items().into_iter().next() {
             Some(pull) => Ok(Some(self.pull_info(target, pull).await?)),
             None => Ok(None),
         }
@@ -523,18 +488,19 @@ impl GitHub for GitHubClient {
         target: &TargetConfig,
         pr: &NewPullRequest,
     ) -> Result<PullRequestInfo> {
-        let path = format!("/repos/{}/{}/pulls", target.owner, target.repo);
-        let response: PullResponse = self
-            .rest_post(
-                &path,
-                json!({
-                    "title": pr.title,
-                    "body": pr.body,
-                    "head": pr.head,
-                    "base": pr.base,
-                }),
-            )
-            .await?;
+        let response = self
+            .octo
+            .pulls(&target.owner, &target.repo)
+            .create(&pr.title, &pr.head, &pr.base)
+            .body(pr.body.clone())
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create pull request for {}/{}",
+                    target.owner, target.repo
+                )
+            })?;
         self.pull_info(target, response).await
     }
 
@@ -547,47 +513,73 @@ impl GitHub for GitHubClient {
         if reviewers.is_empty() {
             return Ok(());
         }
-        let path = format!(
-            "/repos/{}/{}/pulls/{}/requested_reviewers",
-            target.owner, target.repo, pr_number
-        );
-        let _: serde_json::Value = self
-            .rest_post(&path, json!({ "reviewers": reviewers }))
-            .await?;
+        let _ = self
+            .octo
+            .pulls(&target.owner, &target.repo)
+            .request_reviews(
+                github_number(pr_number)?,
+                reviewers.to_vec(),
+                Vec::<String>::new(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to request reviewers for {}/{}#{}",
+                    target.owner, target.repo, pr_number
+                )
+            })?;
         Ok(())
     }
 
-    async fn list_review_comments(
+    async fn list_review_threads(
         &self,
         target: &TargetConfig,
         pr_number: i64,
-    ) -> Result<Vec<ReviewComment>> {
-        let path = format!(
-            "/repos/{}/{}/pulls/{}/comments",
-            target.owner, target.repo, pr_number
-        );
-        let mut comments = Vec::new();
-        let mut page = 1usize;
+    ) -> Result<Vec<ReviewThread>> {
+        let mut threads = Vec::new();
+        let mut after: Option<String> = None;
+        let mut page_count = 0usize;
         loop {
-            let batch: Vec<PullRequestReviewCommentResponse> = self
-                .rest_get_query(
-                    &path,
-                    &[("per_page", "100".to_string()), ("page", page.to_string())],
-                )
-                .await?;
-            let done = batch.len() < 100;
-            comments.extend(batch.into_iter().map(ReviewComment::from));
-            if done {
-                break;
-            }
-            if page >= MAX_REST_PAGES {
+            page_count += 1;
+            if page_count > MAX_GRAPHQL_PAGES {
                 return Err(Error::message(format!(
-                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {path}"
+                    "GitHub GraphQL pagination exceeded {MAX_GRAPHQL_PAGES} pages for review threads"
                 )));
             }
-            page += 1;
+            let data: PullRequestReviewThreadsResponse = self
+                .graphql(
+                    REVIEW_THREADS_QUERY,
+                    json!({
+                        "owner": target.owner,
+                        "repo": target.repo,
+                        "number": pr_number,
+                        "after": after,
+                    }),
+                )
+                .await?;
+            let pull_request = data
+                .repository
+                .and_then(|repository| repository.pull_request)
+                .context(format!(
+                    "pull request {}/{}#{} not found",
+                    target.owner, target.repo, pr_number
+                ))?;
+            let page = pull_request.review_threads;
+            let has_next_page = page.page_info.has_next_page;
+            let next_after = page.page_info.end_cursor.clone();
+            threads.extend(page.nodes.into_iter().map(|node| node.into_review_thread()));
+            if !has_next_page {
+                break;
+            }
+            let next_after = next_after.context("review thread page had no end cursor")?;
+            if after.as_deref() == Some(next_after.as_str()) {
+                return Err(Error::message(
+                    "GitHub review thread pagination cursor did not advance",
+                ));
+            }
+            after = Some(next_after);
         }
-        Ok(comments)
+        Ok(threads)
     }
 }
 
@@ -650,7 +642,7 @@ impl<'a> GitHubAuthenticator<'a> {
     }
 }
 
-impl ReviewComment {
+impl ReviewThread {
     pub(crate) fn line_label(&self) -> String {
         match (self.line, self.original_line) {
             (Some(line), _) => line.to_string(),
@@ -660,18 +652,20 @@ impl ReviewComment {
     }
 }
 
-impl From<PullRequestReviewCommentResponse> for ReviewComment {
-    fn from(comment: PullRequestReviewCommentResponse) -> Self {
-        Self {
-            id: comment.id,
-            review_id: comment.pull_request_review_id,
-            author: comment.user.login,
-            body: comment.body,
-            path: comment.path,
-            line: comment.line,
-            original_line: comment.original_line,
-            diff_hunk: comment.diff_hunk,
-            html_url: comment.html_url,
-        }
-    }
+fn github_number(number: i64) -> Result<u64> {
+    u64::try_from(number).context(format!("GitHub number {number} must be non-negative"))
+}
+
+fn github_id(id: u64) -> Result<i64> {
+    i64::try_from(id).context(format!("GitHub id {id} does not fit in i64"))
+}
+
+fn github_time(seconds: i64, nanos: u32) -> Result<OffsetDateTime> {
+    Ok(OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(seconds) * 1_000_000_000 + i128::from(nanos),
+    )?)
+}
+
+fn is_not_found(err: &octocrab::Error) -> bool {
+    matches!(err, octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 404)
 }

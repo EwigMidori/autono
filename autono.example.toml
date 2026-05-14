@@ -28,6 +28,6 @@ blocked_status = "Blocked"
 reviewers = ["alice", "bob"]
 
 [targets.commands]
-codex = ["codex"]
+codex = ["codex", "exec", "--sandbox", "danger-full-access", "--ask-for-approval", "never"]
 test = ["cargo", "test"]
 max_fix_attempts = 3

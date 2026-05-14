@@ -9,6 +9,30 @@ use crate::workflow::TriageResult;
 
 const PROMPT_SECTION_LIMIT: usize = 200_000;
 const VALIDATION_OUTPUT_PROMPT_LIMIT: usize = 80_000;
+const CODEX_SUBCOMMANDS: &[&str] = &[
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "mcp-server",
+    "app-server",
+    "app",
+    "completion",
+    "update",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "resume",
+    "fork",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
+];
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
@@ -99,8 +123,8 @@ impl CodexRunner {
         repo_path: &Path,
         prompt: &str,
     ) -> Result<CommandOutput> {
-        let (program, args) = self
-            .command(commands)
+        let command = self.command(commands);
+        let (program, args) = command
             .split_first()
             .context("codex command must not be empty")?;
         let output = CommandRunner::new(repo_path)
@@ -110,8 +134,8 @@ impl CodexRunner {
         Ok(output)
     }
 
-    fn command<'a>(&self, commands: &'a CommandsConfig) -> &'a [String] {
-        &commands.codex
+    fn command(&self, commands: &CommandsConfig) -> Vec<String> {
+        normalize_codex_command(&commands.codex)
     }
 
     fn json_object<'a>(&self, text: &'a str) -> Option<&'a str> {
@@ -126,6 +150,31 @@ impl CodexRunner {
     fn first_nonempty_line<'a>(&self, text: &'a str) -> Option<&'a str> {
         text.lines().map(str::trim).find(|line| !line.is_empty())
     }
+}
+
+fn normalize_codex_command(command: &[String]) -> Vec<String> {
+    let Some(program) = command.first() else {
+        return Vec::new();
+    };
+    if !is_codex_executable(program) || command[1..].iter().any(|arg| is_codex_subcommand(arg)) {
+        return command.to_vec();
+    }
+
+    let mut normalized = command.to_vec();
+    normalized.push("exec".to_string());
+    normalized
+}
+
+fn is_codex_executable(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "codex")
+        .unwrap_or(false)
+}
+
+fn is_codex_subcommand(arg: &str) -> bool {
+    CODEX_SUBCOMMANDS.contains(&arg)
 }
 
 impl TriagePrompt {
@@ -302,5 +351,42 @@ mod tests {
         assert!(rendered.contains("[truncated"));
         assert!(rendered.contains("tail"));
         assert!(rendered.len() < prompt.render().len() + validation_output.len());
+    }
+
+    #[test]
+    fn normalizes_bare_codex_command_to_exec() {
+        let command = normalize_codex_command(&[
+            "codex".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ]);
+
+        assert_eq!(
+            command,
+            vec![
+                "codex".to_string(),
+                "--sandbox".to_string(),
+                "danger-full-access".to_string(),
+                "exec".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_codex_subcommand() {
+        let command = normalize_codex_command(&[
+            "codex".to_string(),
+            "exec".to_string(),
+            "--json".to_string(),
+        ]);
+
+        assert_eq!(
+            command,
+            vec![
+                "codex".to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
+            ]
+        );
     }
 }

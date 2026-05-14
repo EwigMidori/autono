@@ -16,15 +16,15 @@ pub enum Error {
     #[error(transparent)]
     Env(#[from] std::env::VarError),
     #[error(transparent)]
-    Header(#[from] reqwest::header::InvalidHeaderValue),
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
-    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
+    Octocrab(#[from] octocrab::Error),
+    #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    TimeComponent(#[from] time::error::ComponentRange),
     #[error(transparent)]
     TimeFormat(#[from] time::error::Format),
     #[error(transparent)]
