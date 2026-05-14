@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[lints.clippy]
+too_many_arguments = "deny"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
