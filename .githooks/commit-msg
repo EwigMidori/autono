@@ -4,10 +4,10 @@ set -eu
 commit_msg_file="${1:?commit message file path is required}"
 first_line="$(head -n 1 "$commit_msg_file")"
 
-if printf '%s\n' "$first_line" | grep -Eq '^(feat|fix|chore|docs|refactor|test|ci|build|perf|style|revert)/[^:[:space:]]+: .+'; then
+if printf '%s\n' "$first_line" | grep -Eq '^(feat|fix|chore|docs|refactor|test|ci|build|perf|style|revert)(\([^)[:space:]]+\))!?: .+'; then
   exit 0
 fi
 
-echo "commit message must use: type/scope: subject"
-echo "example: feat/refaco: rewrite the English documentation"
+echo "commit message must use: type(scope): subject"
+echo "example: feat(refaco): rewrite the English documentation"
 exit 1

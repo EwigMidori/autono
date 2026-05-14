@@ -3,13 +3,13 @@
 This repository uses a local commit message hook that enforces the format:
 
 ```text
-type/scope: subject
+type(scope): subject
 ```
 
 Example:
 
 ```text
-feat/refaco: rewrite the English documentation
+feat(refaco): rewrite the English documentation
 ```
 
 To enable the hook in this clone:
