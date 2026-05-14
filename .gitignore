@@ -1,0 +1,14 @@
+target/
+
+# Local config and state
+reforge.toml
+*.sqlite3
+*.db
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
