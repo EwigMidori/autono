@@ -122,7 +122,7 @@ impl GitHubClient {
             .token()
             .await?;
         let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static("reforge"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("autono"));
         headers.insert(
             ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),

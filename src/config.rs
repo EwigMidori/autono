@@ -98,7 +98,7 @@ impl Config {
     pub fn state_path(&self) -> PathBuf {
         self.state_path
             .clone()
-            .unwrap_or_else(|| self.worktrees_root.join("reforge.sqlite3"))
+            .unwrap_or_else(|| self.worktrees_root.join("autono.sqlite3"))
     }
 
     pub fn github_config(&self) -> &GitHubConfig {

@@ -13,8 +13,8 @@ use crate::git_workspace::{GitWorkspace, WorkIdentity, WorkspaceManager};
 use crate::github::{GitHub, NewPullRequest, ProjectContent, ProjectItem};
 use crate::store::{Store, StoredItem};
 use crate::workflow::{
-    AdminMention, BotMentionPolicy, CommentThread, CommentView, ItemView, ManagedState,
-    ReforgeMarker, ReviewDecision, TriageResult, WorkflowAction, WorkflowPolicy,
+    AdminMention, AutonoMarker, BotMentionPolicy, CommentThread, CommentView, ItemView,
+    ManagedState, ReviewDecision, TriageResult, WorkflowAction, WorkflowPolicy,
 };
 
 #[non_exhaustive]
@@ -583,7 +583,7 @@ impl CommentComposer {
     }
 
     fn marker(&self, item: &ProjectItem, state: ManagedState) -> String {
-        ReforgeMarker::new(&item.id, state).render()
+        AutonoMarker::new(&item.id, state).render()
     }
 
     fn clarification_questions(&self, result: &TriageResult) -> String {

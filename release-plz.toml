@@ -1,0 +1,10 @@
+[workspace]
+pr_labels = ["release"]
+pr_name = "release-plz"
+
+[package]
+release = true
+publish = false
+
+[git]
+require_conventional = true

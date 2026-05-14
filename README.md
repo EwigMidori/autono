@@ -1,6 +1,6 @@
-# Reforge
+# Autono
 
-Reforge is an autonomous coding bot. It watches GitHub Projects v2 items and issue / PR discussion, checks whether a task mentions the configured bot login, triages the request, runs `codex` for repository changes, executes validation commands, creates or updates a PR, and marks the item complete after a human merge.
+Autono is an autonomous coding bot. It watches GitHub Projects v2 items and issue / PR discussion, checks whether a task mentions the configured bot login, triages the request, runs `codex` for repository changes, executes validation commands, creates or updates a PR, and marks the item complete after a human merge.
 
 Its user-facing workflow is simple:
 
@@ -9,7 +9,7 @@ Its user-facing workflow is simple:
 - Review the code
 - Merge the PR
 
-Reforge handles the implementation steps in the middle, so the user can stay in GitHub for requirements, progress, and code review.
+Autono handles the implementation steps in the middle, so the user can stay in GitHub for requirements, progress, and code review.
 
 If you want the full Chinese documentation, see [`docs/README.zh-CN.md`](docs/README.zh-CN.md).
 
@@ -51,7 +51,7 @@ flowchart TD
 
 ## What It Does
 
-Reforge first confirms the request, then moves through implementation phases.
+Autono first confirms the request, then moves through implementation phases.
 
 1. **Discover the task**
    - Reads Projects v2 items
@@ -60,12 +60,12 @@ Reforge first confirms the request, then moves through implementation phases.
 
 2. **Triage**
    - Asks `codex` whether the request is a code change
-   - If the request is discussion, documentation, or another non-implementation task, Reforge replies and marks the item `Blocked`
-   - If the request is unclear, Reforge replies with questions and marks the item `Blocked`
-   - If the request is clear, Reforge stores `AwaitingStart`
+   - If the request is discussion, documentation, or another non-implementation task, Autono replies and marks the item `Blocked`
+   - If the request is unclear, Autono replies with questions and marks the item `Blocked`
+   - If the request is clear, Autono stores `AwaitingStart`
 
 3. **Wait for the start gate**
-   - Reforge waits until the Project `status` field matches `workflow.start_status`
+   - Autono waits until the Project `status` field matches `workflow.start_status`
    - Example: if `start_status = "In Progress"`, the item starts only after you set the Project status to `In Progress`
 
 4. **Implement**
@@ -75,13 +75,13 @@ Reforge first confirms the request, then moves through implementation phases.
    - If validation fails, the failure output is fed back to `codex` for another fix attempt
 
 5. **Review**
-   - After validation passes, Reforge commits and pushes the changes
+   - After validation passes, Autono commits and pushes the changes
    - It creates or reuses a PR
    - It requests reviewers
-   - If review requests changes, Reforge continues on the same branch and worktree
+   - If review requests changes, Autono continues on the same branch and worktree
 
 6. **Complete**
-   - After a human merges the PR, Reforge marks the item complete
+   - After a human merges the PR, Autono marks the item complete
 
 ## Blocked and Recovery
 
@@ -98,20 +98,20 @@ To recover:
 
 1. Add more information in the same thread
 2. Mention the bot again
-3. Reforge runs triage again
+3. Autono runs triage again
 4. If the request is clear now, it moves back to `AwaitingStart`
 5. Then it waits for `workflow.start_status` again
 
 Example:
 
-- You submit a request, but the requirements are incomplete, so Reforge marks it `Blocked`
+- You submit a request, but the requirements are incomplete, so Autono marks it `Blocked`
 - You add implementation details and mention the bot again
-- Reforge triages the updated discussion
+- Autono triages the updated discussion
 - If the task is now actionable, it leaves `Blocked` and resumes the normal flow
 
 ## Configuration
 
-Use a TOML file such as [`reforge.example.toml`](reforge.example.toml).
+Use a TOML file such as [`autono.example.toml`](autono.example.toml).
 
 ### Top-level settings
 
@@ -149,13 +149,13 @@ Use a TOML file such as [`reforge.example.toml`](reforge.example.toml).
 
 ## Example
 
-`reforge.example.toml`:
+`autono.example.toml`:
 
 ```toml
 bot_login = "your-bot-login"
 poll_interval_secs = 60
-worktrees_root = "/srv/reforge/worktrees"
-state_path = "/srv/reforge/state.sqlite3"
+worktrees_root = "/srv/autono/worktrees"
+state_path = "/srv/autono/state.sqlite3"
 
 [github]
 token_source = "gh"
@@ -165,7 +165,7 @@ graphql_url = "https://api.github.com/graphql"
 [[targets]]
 owner = "example"
 repo = "service-a"
-checkout_path = "/srv/reforge/checkouts/service-a"
+checkout_path = "/srv/autono/checkouts/service-a"
 base_branch = "main"
 project_owner = "example"
 project_number = 12
@@ -191,38 +191,38 @@ max_fix_attempts = 3
 
 - `bot_login = "your-bot-login"`: replace this with the bot account used for mentions
 - `start_status = "In Progress"`: the Project item starts only after the status is set to this value
-- `test = ["cargo", "test"]`: Reforge runs `cargo test` after implementation
-- `max_fix_attempts = 3`: after a failed validation, Reforge may ask `codex` to repair the code up to 3 times
+- `test = ["cargo", "test"]`: Autono runs `cargo test` after implementation
+- `max_fix_attempts = 3`: after a failed validation, Autono may ask `codex` to repair the code up to 3 times
 
 ## Quick Start
 
 ```sh
-reforge run --config reforge.toml
+autono run --config autono.toml
 ```
 
 Run continuously and poll according to the configured interval.
 
 ```sh
-reforge once --config reforge.toml
+autono once --config autono.toml
 ```
 
 Run one polling pass. Useful for local debugging.
 
 ```sh
-reforge inspect item --config reforge.toml --repo owner/name --item-id ITEM_ID
+autono inspect item --config autono.toml --repo owner/name --item-id ITEM_ID
 ```
 
 Inspect the stored state for a single item.
 
 ```sh
-reforge recover --config reforge.toml --repo owner/name --item-id ITEM_ID
+autono recover --config autono.toml --repo owner/name --item-id ITEM_ID
 ```
 
 Recover or rebuild the local state for a single item.
 
 ## GitHub Token
 
-Reforge supports two token sources.
+Autono supports two token sources.
 
 ### `token_source = "gh"`
 
@@ -243,14 +243,14 @@ Required steps:
 
 ## Local State
 
-Reforge stores local SQLite state for:
+Autono stores local SQLite state for:
 
 - Managed items
 - Branch, worktree, and PR metadata
 - Last processed comment and review IDs
 - Recovery after interruption
 
-The default state file name is `reforge.sqlite3`. If `state_path` is unset, Reforge stores it under `worktrees_root`.
+The default state file name is `autono.sqlite3`. If `state_path` is unset, Autono stores it under `worktrees_root`.
 
 ## Design Constraints
 

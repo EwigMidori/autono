@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use crate::config::WorkflowConfig;
 
-const MARKER_PREFIX: &str = "<!-- reforge:";
+const MARKER_PREFIX: &str = "<!-- autono:";
 const MARKER_SUFFIX: &str = "-->";
 
 #[non_exhaustive]
@@ -158,12 +158,12 @@ impl BotMentionPolicy {
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReforgeMarker {
+pub(crate) struct AutonoMarker {
     item_id: String,
     state: ManagedState,
 }
 
-impl ReforgeMarker {
+impl AutonoMarker {
     pub(crate) fn new(item_id: &str, state: ManagedState) -> Self {
         Self {
             item_id: item_id.to_string(),
@@ -258,7 +258,7 @@ impl CommentThread {
         self.comments
             .iter()
             .filter_map(|comment| {
-                ReforgeMarker::find_in(&comment.body).map(|marker| MarkerView {
+                AutonoMarker::find_in(&comment.body).map(|marker| MarkerView {
                     comment_id: comment.id,
                     state: marker.state(),
                 })
@@ -333,12 +333,12 @@ mod tests {
 
     #[test]
     fn marker_parser_recovers_state() {
-        let marker = ReforgeMarker::new("I_1", ManagedState::AwaitingStart).render();
+        let marker = AutonoMarker::new("I_1", ManagedState::AwaitingStart).render();
         assert_eq!(
-            ReforgeMarker::find_in(&marker).map(|marker| marker.state()),
+            AutonoMarker::find_in(&marker).map(|marker| marker.state()),
             Some(ManagedState::AwaitingStart)
         );
-        assert_eq!(ReforgeMarker::find_in("plain comment"), None);
+        assert_eq!(AutonoMarker::find_in("plain comment"), None);
     }
 
     #[test]

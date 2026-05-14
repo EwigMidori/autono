@@ -1,6 +1,6 @@
-# Reforge
+# Autono
 
-Reforge 是一个自动编程机器人。它持续轮询 GitHub Projects v2 条目和 issue / PR 讨论，识别需要代码改动的任务，调用 `codex` 修改仓库，运行验证命令，创建 PR，并在人工合并后把项目条目标记为完成。
+Autono 是一个自动编程机器人。它持续轮询 GitHub Projects v2 条目和 issue / PR 讨论，识别需要代码改动的任务，调用 `codex` 修改仓库，运行验证命令，创建 PR，并在人工合并后把项目条目标记为完成。
 
 它的核心卖点是：
 
@@ -46,7 +46,7 @@ flowchart TD
 
 ## 它会做什么
 
-Reforge 会先确认任务内容，再进入实现流程。它的流程分成几步：
+Autono 会先确认任务内容，再进入实现流程。它的流程分成几步：
 
 1. **发现任务**
    - 读取 Projects v2 里的条目
@@ -60,7 +60,7 @@ Reforge 会先确认任务内容，再进入实现流程。它的流程分成几
    - 如果信息够了，就进入 `AwaitingStart`
 
 3. **等待开工**
-   - Reforge 会等待 Project 里的 `status` 字段变成配置中的 `workflow.start_status`
+   - Autono 会等待 Project 里的 `status` 字段变成配置中的 `workflow.start_status`
    - 例如配置是 `start_status = "In Progress"`，那你需要把条目状态改成 `In Progress`
    - 这是人工放行信号
 
@@ -77,7 +77,7 @@ Reforge 会先确认任务内容，再进入实现流程。它的流程分成几
    - 如果 review 要求修改，会继续在同一条工作线上迭代
 
 6. **完成**
-   - PR 被人工合并后，Reforge 将条目标记为完成
+   - PR 被人工合并后，Autono 将条目标记为完成
 
 ## Blocked 和恢复
 
@@ -94,24 +94,24 @@ Reforge 会先确认任务内容，再进入实现流程。它的流程分成几
 
 1. 人工在原线程继续补充信息
 2. 再 @ 一次 bot
-3. Reforge 重新 triage
+3. Autono 重新 triage
 4. 如果现在信息足够，它会回到 `AwaitingStart`
 5. 然后继续等 `workflow.start_status`
 
 例子：
 
-- 你先发了一个需求，但描述不完整，Reforge 回复并标记 `Blocked`
+- 你先发了一个需求，但描述不完整，Autono 回复并标记 `Blocked`
 - 你补了一段接口说明，再 @ bot
-- Reforge 重新判断后发现现在已经能实施
+- Autono 重新判断后发现现在已经能实施
 - 它会重新进入等待开工的状态
 
 ## 配置
 
-使用 TOML 配置文件，例如 [`reforge.example.toml`](../reforge.example.toml)。
+使用 TOML 配置文件，例如 [`autono.example.toml`](../autono.example.toml)。
 
 ### 顶层配置
 
-- `bot_login`：bot 的 GitHub 登录名。Reforge 会检查评论里是否出现这个账号
+- `bot_login`：bot 的 GitHub 登录名。Autono 会检查评论里是否出现这个账号
 - `poll_interval_secs`：轮询间隔
 - `worktrees_root`：worktree 根目录
 - `state_path`：SQLite 状态文件路径
@@ -145,13 +145,13 @@ Reforge 会先确认任务内容，再进入实现流程。它的流程分成几
 
 ## Example
 
-`reforge.example.toml` 长这样：
+`autono.example.toml` 长这样：
 
 ```toml
 bot_login = "your-bot-login"
 poll_interval_secs = 60
-worktrees_root = "/srv/reforge/worktrees"
-state_path = "/srv/reforge/state.sqlite3"
+worktrees_root = "/srv/autono/worktrees"
+state_path = "/srv/autono/state.sqlite3"
 
 [github]
 token_source = "gh"
@@ -161,7 +161,7 @@ graphql_url = "https://api.github.com/graphql"
 [[targets]]
 owner = "example"
 repo = "service-a"
-checkout_path = "/srv/reforge/checkouts/service-a"
+checkout_path = "/srv/autono/checkouts/service-a"
 base_branch = "main"
 project_owner = "example"
 project_number = 12
@@ -186,39 +186,39 @@ max_fix_attempts = 3
 ### 这个例子怎么读
 
 - `bot_login = "your-bot-login"`：把这里换成你实际的 bot 登录名
-- `start_status = "In Progress"`：把 Project 状态改成这个值时，Reforge 才会开始工作
+- `start_status = "In Progress"`：把 Project 状态改成这个值时，Autono 才会开始工作
 - `test = ["cargo", "test"]`：每次改完代码后都会运行 `cargo test`
 - `max_fix_attempts = 3`：测试失败后，最多再让 `codex` 尝试修 3 次
 
 ## 快速开始
 
 ```sh
-reforge run --config reforge.toml
+autono run --config autono.toml
 ```
 
 持续运行，按配置的轮询间隔检查项目。
 
 ```sh
-reforge once --config reforge.toml
+autono once --config autono.toml
 ```
 
 只运行一轮检查，适合本地调试。
 
 ```sh
-reforge inspect item --config reforge.toml --repo owner/name --item-id ITEM_ID
+autono inspect item --config autono.toml --repo owner/name --item-id ITEM_ID
 ```
 
 查看某个 item 当前保存的状态。
 
 ```sh
-reforge recover --config reforge.toml --repo owner/name --item-id ITEM_ID
+autono recover --config autono.toml --repo owner/name --item-id ITEM_ID
 ```
 
 重建或恢复某个 item 的本地状态。
 
 ## GitHub Token
 
-Reforge 支持两种 token 来源。
+Autono 支持两种 token 来源。
 
 ### `token_source = "gh"`
 
@@ -239,14 +239,14 @@ gh auth refresh -s repo -s read:project -s project
 
 ## 本地状态
 
-Reforge 会在本地保存一份 SQLite 状态，用来：
+Autono 会在本地保存一份 SQLite 状态，用来：
 
 - 记录已经接手的 item
 - 记录 branch、worktree 和 PR 信息
 - 记录最后处理到哪个 comment / review
 - 支持断点恢复和幂等执行
 
-默认状态文件名是 `reforge.sqlite3`。如果不显式配置 `state_path`，它会放在 `worktrees_root` 下。
+默认状态文件名是 `autono.sqlite3`。如果不显式配置 `state_path`，它会放在 `worktrees_root` 下。
 
 ## 设计约束
 

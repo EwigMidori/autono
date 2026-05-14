@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
+use autono::{Config, Daemon, GitHubClient, Store};
 use clap::{Args, Parser, Subcommand};
-use reforge::{Config, Daemon, GitHubClient, Store};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "reforge")]
-#[command(about = "Poll GitHub Projects and drive Codex-backed repo workflows")]
+#[command(name = "autono")]
+#[command(about = "Drive Codex-backed repo workflows from GitHub Projects")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -33,7 +33,7 @@ struct RepoItemKey {
 
 #[derive(Debug, Args)]
 struct ConfigArgs {
-    #[arg(short, long, default_value = "reforge.toml")]
+    #[arg(short, long, default_value = "autono.toml")]
     config: PathBuf,
 }
 
@@ -44,7 +44,7 @@ enum InspectCommand {
 
 #[derive(Debug, Args)]
 struct InspectItemArgs {
-    #[arg(short, long, default_value = "reforge.toml")]
+    #[arg(short, long, default_value = "autono.toml")]
     config: PathBuf,
     #[arg(long)]
     repo: String,
@@ -54,7 +54,7 @@ struct InspectItemArgs {
 
 #[derive(Debug, Args)]
 struct RecoverArgs {
-    #[arg(short, long, default_value = "reforge.toml")]
+    #[arg(short, long, default_value = "autono.toml")]
     config: PathBuf,
     #[arg(long)]
     repo: String,

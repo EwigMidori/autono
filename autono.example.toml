@@ -1,7 +1,7 @@
 bot_login = "your-bot-login"
 poll_interval_secs = 60
-worktrees_root = "/srv/reforge/worktrees"
-state_path = "/srv/reforge/state.sqlite3"
+worktrees_root = "/srv/autono/worktrees"
+state_path = "/srv/autono/state.sqlite3"
 
 [github]
 token_source = "gh"
@@ -11,7 +11,7 @@ graphql_url = "https://api.github.com/graphql"
 [[targets]]
 owner = "example"
 repo = "service-a"
-checkout_path = "/srv/reforge/checkouts/service-a"
+checkout_path = "/srv/autono/checkouts/service-a"
 base_branch = "main"
 project_owner = "example"
 project_number = 12
@@ -29,5 +29,5 @@ reviewers = ["alice", "bob"]
 
 [targets.commands]
 codex = ["codex"]
-test = ["cargo test"]
+test = ["cargo", "test"]
 max_fix_attempts = 3
