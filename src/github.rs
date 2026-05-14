@@ -14,8 +14,8 @@ use crate::config::{GitHubConfig, TargetConfig, TokenSource};
 use crate::error::{Error, OptionContext, Result, ResultContext};
 use crate::github_types::{
     GraphQlEnvelope, IssueCommentResponse, PermissionResponse, ProjectFieldsResponse,
-    ProjectItemsResponse, PullResponse, ResolveProjectResponse, ReviewResponse,
-    PROJECT_FIELDS_QUERY, PROJECT_ITEMS_QUERY, RESOLVE_PROJECT_QUERY,
+    ProjectItemsResponse, PullRequestReviewCommentResponse, PullResponse, ResolveProjectResponse,
+    ReviewResponse, PROJECT_FIELDS_QUERY, PROJECT_ITEMS_QUERY, RESOLVE_PROJECT_QUERY,
     UPDATE_PROJECT_FIELD_MUTATION,
 };
 use crate::workflow::{CommentView, ReviewDecision};
@@ -81,6 +81,20 @@ pub struct NewPullRequest {
     pub base: String,
 }
 
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ReviewComment {
+    pub id: i64,
+    pub review_id: Option<i64>,
+    pub author: String,
+    pub body: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub original_line: Option<i64>,
+    pub diff_hunk: String,
+    pub html_url: String,
+}
+
 #[async_trait]
 pub trait GitHub: Send + Sync {
     async fn list_project_items(&self, target: &TargetConfig) -> Result<Vec<ProjectItem>>;
@@ -122,6 +136,11 @@ pub trait GitHub: Send + Sync {
         pr_number: i64,
         reviewers: &[String],
     ) -> Result<()>;
+    async fn list_review_comments(
+        &self,
+        target: &TargetConfig,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewComment>>;
 }
 
 impl GitHubClient {
@@ -537,6 +556,39 @@ impl GitHub for GitHubClient {
             .await?;
         Ok(())
     }
+
+    async fn list_review_comments(
+        &self,
+        target: &TargetConfig,
+        pr_number: i64,
+    ) -> Result<Vec<ReviewComment>> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{}/comments",
+            target.owner, target.repo, pr_number
+        );
+        let mut comments = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let batch: Vec<PullRequestReviewCommentResponse> = self
+                .rest_get_query(
+                    &path,
+                    &[("per_page", "100".to_string()), ("page", page.to_string())],
+                )
+                .await?;
+            let done = batch.len() < 100;
+            comments.extend(batch.into_iter().map(ReviewComment::from));
+            if done {
+                break;
+            }
+            if page >= MAX_REST_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub pagination exceeded {MAX_REST_PAGES} pages for {path}"
+                )));
+            }
+            page += 1;
+        }
+        Ok(comments)
+    }
 }
 
 impl GitHubClient {
@@ -595,5 +647,31 @@ impl<'a> GitHubAuthenticator<'a> {
             .context("gh auth token output was not UTF-8")?
             .trim()
             .to_string())
+    }
+}
+
+impl ReviewComment {
+    pub(crate) fn line_label(&self) -> String {
+        match (self.line, self.original_line) {
+            (Some(line), _) => line.to_string(),
+            (None, Some(original_line)) => format!("original {original_line}"),
+            (None, None) => "unknown".to_string(),
+        }
+    }
+}
+
+impl From<PullRequestReviewCommentResponse> for ReviewComment {
+    fn from(comment: PullRequestReviewCommentResponse) -> Self {
+        Self {
+            id: comment.id,
+            review_id: comment.pull_request_review_id,
+            author: comment.user.login,
+            body: comment.body,
+            path: comment.path,
+            line: comment.line,
+            original_line: comment.original_line,
+            diff_hunk: comment.diff_hunk,
+            html_url: comment.html_url,
+        }
     }
 }

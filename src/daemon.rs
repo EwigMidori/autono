@@ -11,6 +11,7 @@ use crate::config::{Config, TargetConfig};
 use crate::error::{Result, ResultContext};
 use crate::git_workspace::{GitWorkspace, WorkIdentity, WorkspaceManager};
 use crate::github::{GitHub, NewPullRequest, ProjectContent, ProjectItem};
+use crate::review_feedback::{FeedbackRequest, ReviewFeedbackComposer};
 use crate::store::{Store, StoreItemKey, StoredItem, StoredItemBuilder};
 use crate::workflow::{
     AdminMention, AutonoMarker, BotMentionPolicy, CommentThread, CommentView, ItemView,
@@ -28,7 +29,6 @@ pub struct Daemon<G, R = CodexRunner, W = GitWorkspace> {
     comment_composer: CommentComposer,
 }
 
-#[non_exhaustive]
 #[derive(Debug)]
 struct WorkRequest<'a> {
     target: &'a TargetConfig,
@@ -38,9 +38,9 @@ struct WorkRequest<'a> {
     stored: Option<StoredItem>,
     post_work_state: ManagedState,
     handled_review_id: Option<i64>,
+    pr_number: Option<i64>,
 }
 
-#[non_exhaustive]
 #[derive(Debug)]
 struct TriageRequest<'a> {
     target: &'a TargetConfig,
@@ -49,7 +49,6 @@ struct TriageRequest<'a> {
     thread: &'a CommentThread,
     latest_comment_id: Option<i64>,
 }
-
 impl<G: GitHub> Daemon<G, CodexRunner, GitWorkspace> {
     pub fn new(config: Config, github: G) -> Result<Self> {
         let runner = CodexRunner;
@@ -162,6 +161,10 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             None => None,
         };
         let latest_review_id = pr.as_ref().and_then(|pr| pr.latest_review_id);
+        let pr_number = pr
+            .as_ref()
+            .map(|pr| pr.number)
+            .or_else(|| stored.as_ref().and_then(|item| item.pr_number));
         let has_unhandled_review = latest_review_id.is_some()
             && latest_review_id != stored.as_ref().and_then(|item| item.last_review_id);
 
@@ -204,6 +207,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     stored,
                     post_work_state: ManagedState::PrOpen,
                     handled_review_id: None,
+                    pr_number,
                 })
                 .await
             }
@@ -216,6 +220,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     stored,
                     post_work_state: ManagedState::ReviewPending,
                     handled_review_id: latest_review_id,
+                    pr_number,
                 })
                 .await
             }
@@ -338,9 +343,20 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             &identity.worktree_path.to_string_lossy(),
         )?;
 
+        let feedback = ReviewFeedbackComposer::default();
+        let feedback_request = FeedbackRequest::new(
+            work.target,
+            work.post_work_state,
+            work.pr_number,
+            work.handled_review_id,
+        );
+        let review_feedback = feedback
+            .trusted_feedback_for_state(&self.github, feedback_request)
+            .await?;
         let discussion = self
             .comment_composer
             .discussion_text(work.thread.comments());
+        let discussion = feedback.prepend_to_discussion(&review_feedback, &discussion);
         let prompt =
             ImplementationPrompt::new(&work.content.title, &discussion, &work.target.commands.test);
         let prompt_text = prompt.render();

@@ -250,6 +250,25 @@ pub(crate) struct ReviewResponse {
     pub(crate) state: String,
 }
 
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullRequestReviewCommentResponse {
+    pub(crate) id: i64,
+    #[serde(default)]
+    pub(crate) pull_request_review_id: Option<i64>,
+    pub(crate) body: String,
+    pub(crate) user: UserResponse,
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) line: Option<i64>,
+    #[serde(default)]
+    pub(crate) original_line: Option<i64>,
+    #[serde(default)]
+    pub(crate) diff_hunk: String,
+    #[serde(default)]
+    pub(crate) html_url: String,
+}
+
 pub(crate) const RESOLVE_PROJECT_QUERY: &str = r#"
 query ResolveProject($login: String!, $number: Int!) {
   organization(login: $login) { projectV2(number: $number) { id } }

@@ -7,8 +7,8 @@ use crate::error::{OptionContext, Result, ResultContext};
 use crate::git_workspace::{CommandOutput, CommandRunner};
 use crate::workflow::TriageResult;
 
-const PROMPT_SECTION_LIMIT: usize = 24_000;
-const VALIDATION_OUTPUT_PROMPT_LIMIT: usize = 12_000;
+const PROMPT_SECTION_LIMIT: usize = 200_000;
+const VALIDATION_OUTPUT_PROMPT_LIMIT: usize = 80_000;
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
