@@ -17,3 +17,9 @@ To enable the hook in this clone:
 ```sh
 git config core.hooksPath .githooks
 ```
+
+Or run:
+
+```sh
+./scripts/setup-githooks.sh
+```
