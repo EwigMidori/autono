@@ -1,6 +1,6 @@
-# Reforge
+# Autono
 
-Reforge is an autonomous coding bot. It watches GitHub Projects v2 items and issue / PR discussion, checks whether a task mentions the configured bot login, triages the request, runs `codex` for repository changes, executes validation commands, creates or updates a PR, and marks the item complete after a human merge.
+Autono is an autonomous coding bot. It watches GitHub Projects v2 items and issue / PR discussion, checks whether a task mentions the configured bot login, triages the request, runs `codex` for repository changes, executes validation commands, creates or updates a PR, and marks the item complete after a human merge.
 
 Its user-facing workflow is simple:
 
@@ -9,7 +9,9 @@ Its user-facing workflow is simple:
 - Review the code
 - Merge the PR
 
-Reforge handles the implementation steps in the middle, so the user can stay in GitHub for requirements, progress, and code review.
+Autono handles the implementation steps in the middle, so the user can stay in GitHub for requirements, progress, and code review.
+
+On `run` and `once`, Autono performs a startup preflight before contacting GitHub. It checks local directories and configured commands so missing checkouts, state directories, or tools fail fast.
 
 If you want the full Chinese documentation, see [`docs/README.zh-CN.md`](docs/README.zh-CN.md).
 
@@ -26,32 +28,72 @@ If you want to understand the flow first, start with the workflow diagram below.
 
 ```mermaid
 flowchart TD
-  A[Poll Projects v2 items] --> B{Did a write/admin user mention @BOT_LOGIN?}
-  B -- No --> Z[Ignore]
-  B -- Yes --> C[Triage: decide whether this is a code change request]
-  C --> D{Need code changes?}
-  D -- No --> E[Reply with a reason and mark Blocked]
-  D -- Yes --> F{Is the request clear enough?}
-  F -- No --> G[Reply with clarification questions and mark Blocked]
-  F -- Yes --> H[Wait for the Project status to reach start_status]
-  H --> I[Create a branch and a worktree]
-  I --> J[Run codex]
-  J --> K[Run validation commands]
-  K --> L{Did validation pass?}
-  L -- No --> M[Reply with the failure and mark Blocked]
-  L -- Yes --> N[Commit and push]
-  N --> O[Create or reuse a PR]
-  O --> P[Request reviewers]
-  P --> Q{Does review request changes?}
-  Q -- Yes --> J
-  Q -- No --> R{Was the PR merged by a human?}
-  R -- No --> P
-  R -- Yes --> S[Mark the item complete]
+  A[MECH: Poll Projects v2 items] --> B{MECH: Did a write/admin user mention @BOT_LOGIN?}
+  B -- No --> Z[MECH: Ignore]
+  B -- Yes --> C[AI: Triage request]
+  C --> D{AI: Need code changes?}
+  D -- No --> E[MECH: Reply with AI reason and mark Blocked]
+  D -- Yes --> F{AI: Is the request clear enough?}
+  F -- No --> G[MECH: Reply with AI clarification questions and mark Blocked]
+  F -- Yes --> H[MECH: Wait for Project status to reach start_status]
+  H --> HS{MECH: start_status reached?}
+  HS -- Yes --> I[MECH: Create branch and worktree]
+  HS -- No --> HC{MECH: New human comment before start?}
+  HC -- Yes --> DM[AI: Monitor discussion and draft reply]
+  DM --> DR[MECH: Post reply only if AI says needed]
+  DR --> H
+  HC -- No --> H
+  I --> J[AI: Implement with codex]
+  J --> K[MECH: Run validation commands]
+  K --> L{MECH: Did validation pass?}
+  L -- "No, retries remain" --> M[AI: Repair from validation output]
+  M --> K
+  L -- "No, retries exhausted" --> BV[MECH: Mark Blocked with validation failure]
+  L -- Yes --> N[MECH: Commit, push, and verify remote branch]
+  N --> ND{MECH: Branch has changes or existing PR?}
+  ND -- No --> BN[MECH: Mark Blocked with no changes]
+  ND -- Yes --> O[MECH: Create or reuse draft PR]
+  O --> P[AI: Completion check]
+  P --> W{AI: Complete?}
+  W -- "Needs work, retries remain" --> J
+  W -- "Blocked or retries exhausted" --> BC[MECH: Mark Blocked with completion result]
+  W -- Yes --> X[MECH: Finalize local changes and sync PR branch]
+  X --> Q[AI: Self-review]
+  Q --> V{AI: Ready for human review?}
+  V -- "Needs fix, retries remain" --> J
+  V -- "Blocked or retries exhausted" --> BS[MECH: Mark Blocked with self-review result]
+  V -- Yes --> R[MECH: Mark PR ready and request reviewers]
+  R --> HR[HUMAN: Review PR or merge it]
+  HR --> T{MECH: Human review state?}
+  T -- Changes requested --> RF[MECH: Collect trusted review feedback]
+  RF --> J
+  T -- Approved --> U{MECH: PR merged by a human?}
+  T -- No decision yet --> WR[MECH: Wait for review]
+  WR --> T
+  U -- No --> WM[MECH: Wait for merge]
+  WM --> U
+  U -- Yes --> S[MECH: Mark item complete]
+  E --> BH
+  G --> BH[MECH: Wait while Blocked]
+  BV --> BH
+  BN --> BH
+  BC --> BH
+  BS --> BH
+  BH --> BHC{MECH: New human comment?}
+  BHC -- Yes --> DM
+  BHC -- No --> BH
+
+  classDef ai fill:#e7f0ff,stroke:#2f6fed,color:#12233f;
+  classDef mech fill:#eef8f1,stroke:#268a46,color:#102a18;
+  classDef human fill:#fff4df,stroke:#b66a00,color:#3a2500;
+  class C,D,F,DM,J,M,P,W,Q,V ai;
+  class A,B,Z,E,G,H,HC,DR,HS,I,K,L,BV,N,ND,BN,O,X,R,BC,BS,T,RF,WR,U,WM,S,BH,BHC mech;
+  class HR human;
 ```
 
 ## What It Does
 
-Reforge first confirms the request, then moves through implementation phases.
+Autono first confirms the request, then moves through implementation phases.
 
 1. **Discover the task**
    - Reads Projects v2 items
@@ -60,28 +102,31 @@ Reforge first confirms the request, then moves through implementation phases.
 
 2. **Triage**
    - Asks `codex` whether the request is a code change
-   - If the request is discussion, documentation, or another non-implementation task, Reforge replies and marks the item `Blocked`
-   - If the request is unclear, Reforge replies with questions and marks the item `Blocked`
-   - If the request is clear, Reforge stores `AwaitingStart`
+   - If the request is discussion, documentation, or another non-implementation task, Autono replies and marks the item `Blocked`
+   - If the request is unclear, Autono replies with questions and marks the item `Blocked`
+   - If the request is clear, Autono stores `AwaitingStart` and keeps watching new comments for follow-up replies before implementation starts
 
 3. **Wait for the start gate**
-   - Reforge waits until the Project `status` field matches `workflow.start_status`
+   - Autono waits until the Project `status` field matches `workflow.start_status`
    - Example: if `start_status = "In Progress"`, the item starts only after you set the Project status to `In Progress`
 
 4. **Implement**
    - Creates a branch and a worktree
    - Runs `codex`
+   - Gives `codex` a read-only reference to the base checkout for context
    - Runs the configured validation commands
    - If validation fails, the failure output is fed back to `codex` for another fix attempt
 
 5. **Review**
-   - After validation passes, Reforge commits and pushes the changes
-   - It creates or reuses a PR
-   - It requests reviewers
-   - If review requests changes, Reforge continues on the same branch and worktree
+   - After validation passes, Autono commits and pushes the changes
+   - It creates or reuses a draft PR
+   - It checks whether the implementation is complete, finalizes local changes, and verifies the remote PR branch matches the local branch
+   - It runs an AI self-review, posts the self-review result to the PR, and fixes findings before human review
+   - Once self-review passes, it posts `Review Ready`, marks the PR ready for review, and requests reviewers
+   - If human review requests changes, Autono continues on the same branch and worktree, replies to active review threads, resolves them after the fix lands, and repeats the self-review gate before asking humans again
 
 6. **Complete**
-   - After a human merges the PR, Reforge marks the item complete
+   - After a human merges the PR, Autono marks the item complete
 
 ## Blocked and Recovery
 
@@ -98,20 +143,20 @@ To recover:
 
 1. Add more information in the same thread
 2. Mention the bot again
-3. Reforge runs triage again
+3. Autono runs triage again
 4. If the request is clear now, it moves back to `AwaitingStart`
 5. Then it waits for `workflow.start_status` again
 
 Example:
 
-- You submit a request, but the requirements are incomplete, so Reforge marks it `Blocked`
+- You submit a request, but the requirements are incomplete, so Autono marks it `Blocked`
 - You add implementation details and mention the bot again
-- Reforge triages the updated discussion
+- Autono triages the updated discussion
 - If the task is now actionable, it leaves `Blocked` and resumes the normal flow
 
 ## Configuration
 
-Use a TOML file such as [`reforge.example.toml`](reforge.example.toml).
+Use a TOML file such as [`autono.example.toml`](autono.example.toml).
 
 ### Top-level settings
 
@@ -119,6 +164,7 @@ Use a TOML file such as [`reforge.example.toml`](reforge.example.toml).
 - `poll_interval_secs`: polling interval
 - `worktrees_root`: worktree root directory
 - `state_path`: SQLite state file path
+- `max_fix_attempts_limit`: upper bound allowed for any target's `commands.max_fix_attempts`
 - `[github]`: GitHub API and token source settings
 - `[[targets]]`: one or more repository / project targets
 
@@ -149,13 +195,14 @@ Use a TOML file such as [`reforge.example.toml`](reforge.example.toml).
 
 ## Example
 
-`reforge.example.toml`:
+`autono.example.toml`:
 
 ```toml
 bot_login = "your-bot-login"
 poll_interval_secs = 60
-worktrees_root = "/srv/reforge/worktrees"
-state_path = "/srv/reforge/state.sqlite3"
+worktrees_root = "/srv/autono/worktrees"
+state_path = "/srv/autono/state.sqlite3"
+max_fix_attempts_limit = 10
 
 [github]
 token_source = "gh"
@@ -165,7 +212,7 @@ graphql_url = "https://api.github.com/graphql"
 [[targets]]
 owner = "example"
 repo = "service-a"
-checkout_path = "/srv/reforge/checkouts/service-a"
+checkout_path = "/srv/autono/checkouts/service-a"
 base_branch = "main"
 project_owner = "example"
 project_number = 12
@@ -182,7 +229,7 @@ blocked_status = "Blocked"
 reviewers = ["alice", "bob"]
 
 [targets.commands]
-codex = ["codex"]
+codex = ["codex", "exec", "--sandbox", "danger-full-access", "--ask-for-approval", "never"]
 test = ["cargo", "test"]
 max_fix_attempts = 3
 ```
@@ -191,38 +238,36 @@ max_fix_attempts = 3
 
 - `bot_login = "your-bot-login"`: replace this with the bot account used for mentions
 - `start_status = "In Progress"`: the Project item starts only after the status is set to this value
-- `test = ["cargo", "test"]`: Reforge runs `cargo test` after implementation
-- `max_fix_attempts = 3`: after a failed validation, Reforge may ask `codex` to repair the code up to 3 times
+- `test = ["cargo", "test"]`: Autono runs `cargo test` after implementation
+- `max_fix_attempts = 3`: after a failed validation, Autono may ask `codex` to repair the code up to 3 times
 
 ## Quick Start
 
 ```sh
-reforge run --config reforge.toml
+autono run --config autono.toml
 ```
 
 Run continuously and poll according to the configured interval.
 
 ```sh
-reforge once --config reforge.toml
+autono once --config autono.toml
 ```
 
 Run one polling pass. Useful for local debugging.
 
 ```sh
-reforge inspect item --config reforge.toml --repo owner/name --item-id ITEM_ID
+autono inspect item --config autono.toml --repo owner/name --item-id ITEM_ID
 ```
 
 Inspect the stored state for a single item.
 
 ```sh
-reforge recover --config reforge.toml --repo owner/name --item-id ITEM_ID
+autono recover --config autono.toml --repo owner/name --item-id ITEM_ID
 ```
 
 Recover or rebuild the local state for a single item.
 
 ## GitHub Token
-
-Reforge supports two token sources.
 
 ### `token_source = "gh"`
 
@@ -232,25 +277,16 @@ Uses the `gh` login session. The session needs repository and Projects permissio
 gh auth refresh -s repo -s read:project -s project
 ```
 
-### `token_source = "env"`
-
-Uses the `GITHUB_TOKEN` environment variable.
-
-Required steps:
-
-- Set `GITHUB_TOKEN`
-- Change `token_source` to `env`
-
 ## Local State
 
-Reforge stores local SQLite state for:
+Autono stores local SQLite state for:
 
 - Managed items
 - Branch, worktree, and PR metadata
 - Last processed comment and review IDs
 - Recovery after interruption
 
-The default state file name is `reforge.sqlite3`. If `state_path` is unset, Reforge stores it under `worktrees_root`.
+The default state file name is `autono.sqlite3`. If `state_path` is unset, Autono stores it under `worktrees_root`.
 
 ## Design Constraints
 

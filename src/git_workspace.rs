@@ -1,0 +1,378 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use tokio::process::Command;
+use tokio::time::{self, Duration};
+
+use crate::config::TargetConfig;
+use crate::error::{Error, OptionContext, Result, ResultContext};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const ERROR_OUTPUT_LIMIT: usize = 12_000;
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct WorkIdentity {
+    pub branch: String,
+    pub worktree_path: PathBuf,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GitWorkspace {
+    worktrees_root: PathBuf,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub(crate) struct CommandRunner {
+    working_dir: PathBuf,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub(crate) struct CommandOutput {
+    pub(crate) status_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+impl GitWorkspace {
+    pub fn new(worktrees_root: PathBuf) -> Self {
+        Self { worktrees_root }
+    }
+
+    fn identity(&self, target: &TargetConfig, item_id: &str, title: &str) -> WorkIdentity {
+        let digest = self.short_hash(item_id);
+        let slug = self.slugify(title);
+        let branch = format!("agent/{digest}-{slug}");
+        let worktree_path = self
+            .worktrees_root
+            .join(&target.owner)
+            .join(&target.repo)
+            .join(branch.replace('/', "__"));
+        WorkIdentity {
+            branch,
+            worktree_path,
+        }
+    }
+
+    async fn has_changes(&self, worktree: &Path) -> Result<bool> {
+        let output = self.git(worktree, &["status", "--porcelain"]).await?;
+        output.ensure_success("git status")?;
+        Ok(!output.stdout.trim().is_empty())
+    }
+
+    async fn branch_has_diff_against_base(
+        &self,
+        worktree: &Path,
+        base_branch: &str,
+    ) -> Result<bool> {
+        let range = format!("origin/{base_branch}...HEAD");
+        let output = self
+            .git(worktree, &["diff", "--quiet", &range, "--"])
+            .await?;
+        match output.status_code {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => {
+                output.ensure_success("git diff")?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn branch_exists(&self, working_dir: &Path, branch: &str) -> Result<bool> {
+        let output = self
+            .git(working_dir, &["rev-parse", "--verify", branch])
+            .await?;
+        Ok(output.status_code == Some(0))
+    }
+
+    async fn current_head_sha(&self, worktree: &Path) -> Result<String> {
+        let output = self.git(worktree, &["rev-parse", "HEAD"]).await?;
+        output.ensure_success("git rev-parse HEAD")?;
+        Ok(output.stdout.trim().to_string())
+    }
+
+    async fn remote_branch_head_sha(
+        &self,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let ref_name = format!("refs/heads/{branch}");
+        let output = self
+            .git(worktree, &["ls-remote", "origin", &ref_name])
+            .await?;
+        output.ensure_success("git ls-remote")?;
+        Ok(output
+            .stdout
+            .split_whitespace()
+            .next()
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string))
+    }
+
+    async fn git(&self, working_dir: &Path, args: &[&str]) -> Result<CommandOutput> {
+        CommandRunner::new(working_dir).git(args).await
+    }
+
+    fn path_arg<'a>(&self, path: &'a Path) -> Result<&'a str> {
+        path.to_str()
+            .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
+    }
+
+    fn short_hash(&self, input: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        let hash = hasher.finalize();
+        format!("{hash:x}")[..10].to_string()
+    }
+
+    fn slugify(&self, input: &str) -> String {
+        let mut slug = String::new();
+        let mut last_dash = false;
+        for ch in input.chars().flat_map(|ch| ch.to_lowercase()) {
+            if ch.is_ascii_alphanumeric() {
+                slug.push(ch);
+                last_dash = false;
+            } else if !last_dash {
+                slug.push('-');
+                last_dash = true;
+            }
+            if slug.len() >= 48 {
+                break;
+            }
+        }
+        let slug = slug.trim_matches('-');
+        if slug.is_empty() {
+            "task".to_string()
+        } else {
+            slug.to_string()
+        }
+    }
+}
+
+#[async_trait]
+pub trait WorkspaceManager: Send + Sync {
+    fn identity(&self, target: &TargetConfig, item_id: &str, title: &str) -> WorkIdentity;
+    async fn ensure_worktree(&self, target: &TargetConfig, identity: &WorkIdentity) -> Result<()>;
+    async fn commit_all(&self, worktree: &Path, message: &str) -> Result<bool>;
+    async fn has_uncommitted_changes(&self, worktree: &Path) -> Result<bool>;
+    async fn has_diff_against_base(&self, worktree: &Path, base_branch: &str) -> Result<bool>;
+    async fn head_sha(&self, worktree: &Path) -> Result<String>;
+    async fn remote_head_sha(&self, worktree: &Path, branch: &str) -> Result<Option<String>>;
+    async fn push(&self, worktree: &Path, branch: &str) -> Result<()>;
+}
+
+#[async_trait]
+impl WorkspaceManager for GitWorkspace {
+    fn identity(&self, target: &TargetConfig, item_id: &str, title: &str) -> WorkIdentity {
+        self.identity(target, item_id, title)
+    }
+
+    async fn ensure_worktree(&self, target: &TargetConfig, identity: &WorkIdentity) -> Result<()> {
+        fs::create_dir_all(
+            identity
+                .worktree_path
+                .parent()
+                .context("worktree path has no parent")?,
+        )?;
+        if identity.worktree_path.exists() {
+            return Ok(());
+        }
+        let output = if self
+            .branch_exists(&target.checkout_path, &identity.branch)
+            .await?
+        {
+            self.git(
+                &target.checkout_path,
+                &[
+                    "worktree",
+                    "add",
+                    self.path_arg(&identity.worktree_path)?,
+                    &identity.branch,
+                ],
+            )
+            .await?
+        } else {
+            self.git(
+                &target.checkout_path,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &identity.branch,
+                    self.path_arg(&identity.worktree_path)?,
+                    &target.base_branch,
+                ],
+            )
+            .await?
+        };
+        output.ensure_success("git worktree add")?;
+        Ok(())
+    }
+
+    async fn commit_all(&self, worktree: &Path, message: &str) -> Result<bool> {
+        if !self.has_changes(worktree).await? {
+            return Ok(false);
+        }
+        self.git(worktree, &["add", "-A"])
+            .await?
+            .ensure_success("git add")?;
+        self.git(worktree, &["commit", "-m", message])
+            .await?
+            .ensure_success("git commit")?;
+        Ok(true)
+    }
+
+    async fn has_uncommitted_changes(&self, worktree: &Path) -> Result<bool> {
+        self.has_changes(worktree).await
+    }
+
+    async fn has_diff_against_base(&self, worktree: &Path, base_branch: &str) -> Result<bool> {
+        self.branch_has_diff_against_base(worktree, base_branch)
+            .await
+    }
+
+    async fn head_sha(&self, worktree: &Path) -> Result<String> {
+        self.current_head_sha(worktree).await
+    }
+
+    async fn remote_head_sha(&self, worktree: &Path, branch: &str) -> Result<Option<String>> {
+        self.remote_branch_head_sha(worktree, branch).await
+    }
+
+    async fn push(&self, worktree: &Path, branch: &str) -> Result<()> {
+        self.git(worktree, &["push", "-u", "origin", branch])
+            .await?
+            .ensure_success("git push")
+    }
+}
+
+impl CommandRunner {
+    pub(crate) fn new(working_dir: impl AsRef<Path>) -> Self {
+        Self {
+            working_dir: working_dir.as_ref().to_path_buf(),
+        }
+    }
+
+    pub(crate) async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> Result<CommandOutput> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .current_dir(&self.working_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn {program}"))?;
+        let output = time::timeout(COMMAND_TIMEOUT, async {
+            if let Some(stdin) = stdin {
+                let mut child_stdin = child.stdin.take().context("failed to open child stdin")?;
+                use tokio::io::AsyncWriteExt;
+                child_stdin.write_all(stdin.as_bytes()).await?;
+                child_stdin.shutdown().await?;
+            }
+            child
+                .wait_with_output()
+                .await
+                .with_context(|| format!("failed to wait for {program}"))
+        })
+        .await
+        .map_err(|_| Error::timeout(format!("{program} exceeded 3600 seconds")))??;
+        Ok(CommandOutput {
+            status_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    pub(crate) async fn git(&self, args: &[&str]) -> Result<CommandOutput> {
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        self.run("git", &args, None).await
+    }
+}
+
+impl CommandOutput {
+    pub(crate) fn ensure_success(&self, label: &str) -> Result<()> {
+        if self.status_code == Some(0) {
+            Ok(())
+        } else {
+            Err(Error::message(format!(
+                "{label} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                self.status_code,
+                truncate_output(&self.stdout, ERROR_OUTPUT_LIMIT),
+                truncate_output(&self.stderr, ERROR_OUTPUT_LIMIT)
+            )))
+        }
+    }
+}
+
+fn truncate_output(input: &str, limit: usize) -> String {
+    if input.len() <= limit {
+        return input.to_string();
+    }
+    let note = format!("\n[truncated {} bytes]", input.len() - limit);
+    let body_limit = limit.saturating_sub(note.len());
+    let end = input
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= body_limit)
+        .last()
+        .unwrap_or(0);
+    format!("{}{}", &input[..end], note)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CommandsConfig, ReviewConfig, WorkflowConfig};
+
+    #[test]
+    fn identity_is_stable_and_safe() {
+        let target = TargetConfig {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            checkout_path: "/tmp/repo".into(),
+            base_branch: "main".to_string(),
+            project_owner: None,
+            project_id: Some("P".to_string()),
+            project_number: None,
+            workflow: WorkflowConfig {
+                status_field: "Status".to_string(),
+                triaged_status: "Triaged".to_string(),
+                start_status: "In Progress".to_string(),
+                review_status: "In Review".to_string(),
+                done_status: "Done".to_string(),
+                blocked_status: "Blocked".to_string(),
+            },
+            review: ReviewConfig::default(),
+            commands: CommandsConfig {
+                codex: vec!["codex".to_string()],
+                test: vec![],
+                max_fix_attempts: 3,
+            },
+        };
+        let workspace = GitWorkspace::new("/tmp/worktrees".into());
+        let a = workspace.identity(&target, "ITEM_1", "Fix OAuth callback!");
+        let b = workspace.identity(&target, "ITEM_1", "Fix OAuth callback!");
+        assert_eq!(a.branch, b.branch);
+        assert!(a.branch.starts_with("agent/"));
+        assert!(!a.branch.contains(' '));
+    }
+}
