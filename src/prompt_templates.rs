@@ -1,6 +1,8 @@
 pub(crate) const TRIAGE: &str = include_str!("../prompts/triage.md");
 pub(crate) const IMPLEMENTATION: &str = include_str!("../prompts/implementation.md");
 pub(crate) const IMPLEMENTATION_REPAIR: &str = include_str!("../prompts/implementation_repair.md");
+pub(crate) const COMPLETION_CHECK: &str = include_str!("../prompts/completion_check.md");
+pub(crate) const COMPLETION_REPAIR: &str = include_str!("../prompts/completion_repair.md");
 pub(crate) const SELF_REVIEW: &str = include_str!("../prompts/self_review.md");
 pub(crate) const SELF_REVIEW_REPAIR: &str = include_str!("../prompts/self_review_repair.md");
 pub(crate) const DISCUSSION_MONITOR: &str = include_str!("../prompts/discussion_monitor.md");

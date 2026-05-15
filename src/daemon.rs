@@ -5,11 +5,12 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::codex_runner::{
-    AgentRunner, CodexRunner, DiscussionPrompt, DiscussionPromptContext, ImplementationPrompt,
-    SelfReviewOutcome, SelfReviewResult, TriagePrompt, ValidationRunner,
+    AgentRunner, CodexRunner, CompletionCheckResult, CompletionOutcome, DiscussionPrompt,
+    DiscussionPromptContext, ImplementationPrompt, SelfReviewOutcome, SelfReviewResult,
+    TriagePrompt, ValidationRunner,
 };
 use crate::config::{Config, TargetConfig};
-use crate::error::{Result, ResultContext};
+use crate::error::{Error, Result, ResultContext};
 use crate::git_workspace::{GitWorkspace, WorkIdentity, WorkspaceManager};
 use crate::github::{GitHub, NewPullRequest, ProjectContent, ProjectItem};
 use crate::review_feedback::{FeedbackRequest, ReviewFeedbackComposer};
@@ -540,23 +541,14 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             return Ok(());
         }
 
-        let committed = self
-            .workspace
-            .commit_all(
-                &identity.worktree_path,
+        let branch_has_changes = self
+            .finalize_worktree(
+                &identity,
+                work.target,
                 &format!("Implement {}", work.content.title),
+                &validation,
             )
             .await?;
-        let branch_has_changes = committed
-            || self
-                .workspace
-                .has_diff_against_base(&identity.worktree_path, work.target.base_branch())
-                .await?;
-        if branch_has_changes {
-            self.workspace
-                .push(&identity.worktree_path, &identity.branch)
-                .await?;
-        }
 
         let pr = match self
             .github
@@ -699,7 +691,20 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         self.github
             .convert_pull_request_to_draft(work.target, &pr)
             .await?;
+        if !self
+            .run_completion_gate(&work, identity, prompt, validation)
+            .await?
+        {
+            return Ok(());
+        }
         for attempt in 0..=work.target.commands.max_fix_attempts {
+            self.finalize_worktree(
+                identity,
+                work.target,
+                &format!("Finalize {}", work.content.title),
+                validation,
+            )
+            .await?;
             let review_prompt = prompt.render_self_review();
             let review = self
                 .runner
@@ -718,6 +723,13 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
 
             match review.outcome {
                 SelfReviewOutcome::Ready => {
+                    self.finalize_worktree(
+                        identity,
+                        work.target,
+                        &format!("Finalize {}", work.content.title),
+                        validation,
+                    )
+                    .await?;
                     self.github
                         .mark_pull_request_ready(work.target, &pr)
                         .await?;
@@ -781,26 +793,13 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                             .await?;
                         validation.run().await?;
                     }
-                    let committed = self
-                        .workspace
-                        .commit_all(
-                            &identity.worktree_path,
-                            &format!("Address self-review for {}", work.content.title),
-                        )
-                        .await?;
-                    if committed
-                        || self
-                            .workspace
-                            .has_diff_against_base(
-                                &identity.worktree_path,
-                                work.target.base_branch(),
-                            )
-                            .await?
-                    {
-                        self.workspace
-                            .push(&identity.worktree_path, &identity.branch)
-                            .await?;
-                    }
+                    self.finalize_worktree(
+                        identity,
+                        work.target,
+                        &format!("Address self-review for {}", work.content.title),
+                        validation,
+                    )
+                    .await?;
                 }
                 SelfReviewOutcome::NeedsFix | SelfReviewOutcome::Blocked => {
                     self.store.mark_state(
@@ -831,6 +830,129 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             }
         }
         Ok(())
+    }
+
+    async fn run_completion_gate(
+        &self,
+        work: &WorkRequest<'_>,
+        identity: &WorkIdentity,
+        prompt: &ImplementationPrompt,
+        validation: &ValidationRunner,
+    ) -> Result<bool> {
+        for attempt in 0..=work.target.commands.max_fix_attempts {
+            self.finalize_worktree(
+                identity,
+                work.target,
+                &format!("Finalize {}", work.content.title),
+                validation,
+            )
+            .await?;
+            let completion_prompt = prompt.render_completion_check();
+            let completion = self
+                .runner
+                .completion_check(
+                    &work.target.commands,
+                    &identity.worktree_path,
+                    &completion_prompt,
+                )
+                .await?;
+            match completion.outcome {
+                CompletionOutcome::Complete => return Ok(true),
+                CompletionOutcome::NeedsWork if attempt < work.target.commands.max_fix_attempts => {
+                    let repair_prompt = prompt.render_completion_repair(&completion);
+                    self.runner
+                        .implement(
+                            &work.target.commands,
+                            &identity.worktree_path,
+                            &repair_prompt,
+                        )
+                        .await?;
+                }
+                CompletionOutcome::NeedsWork | CompletionOutcome::Blocked => {
+                    self.store.mark_state(
+                        StoreItemKey::new(&work.target.owner, &work.target.repo, &work.item.id),
+                        ManagedState::Blocked,
+                        work.thread
+                            .comments()
+                            .iter()
+                            .map(|comment| comment.id)
+                            .max(),
+                    )?;
+                    self.try_create_issue_comment(
+                        work.target,
+                        work.content.number,
+                        &self
+                            .comment_composer
+                            .blocked_completion_comment(work.item, &completion),
+                    )
+                    .await;
+                    self.try_set_project_status(
+                        work.target,
+                        work.item,
+                        &work.target.workflow.blocked_status,
+                    )
+                    .await;
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn finalize_worktree(
+        &self,
+        identity: &WorkIdentity,
+        target: &TargetConfig,
+        commit_message: &str,
+        validation: &ValidationRunner,
+    ) -> Result<bool> {
+        validation.run().await?;
+        self.workspace
+            .commit_all(&identity.worktree_path, commit_message)
+            .await?;
+        let branch_has_changes = self
+            .workspace
+            .has_diff_against_base(&identity.worktree_path, target.base_branch())
+            .await?;
+        if branch_has_changes {
+            if !self.remote_matches_head(identity).await? {
+                self.workspace
+                    .push(&identity.worktree_path, &identity.branch)
+                    .await?;
+            }
+            self.ensure_remote_matches_head(identity).await?;
+        }
+        if self
+            .workspace
+            .has_uncommitted_changes(&identity.worktree_path)
+            .await?
+        {
+            return Err(Error::message(format!(
+                "worktree {} still has uncommitted changes after finalization",
+                identity.worktree_path.display()
+            )));
+        }
+        Ok(branch_has_changes)
+    }
+
+    async fn ensure_remote_matches_head(&self, identity: &WorkIdentity) -> Result<()> {
+        if self.remote_matches_head(identity).await? {
+            return Ok(());
+        }
+        let head = self.workspace.head_sha(&identity.worktree_path).await?;
+        Err(Error::message(format!(
+            "remote branch {} is not synchronized with local HEAD {}",
+            identity.branch, head
+        )))
+    }
+
+    async fn remote_matches_head(&self, identity: &WorkIdentity) -> Result<bool> {
+        let head = self.workspace.head_sha(&identity.worktree_path).await?;
+        let remote = self
+            .workspace
+            .remote_head_sha(&identity.worktree_path, &identity.branch)
+            .await?;
+        Ok(remote.as_deref() == Some(head.as_str()))
     }
 
     async fn complete(
@@ -1000,6 +1122,18 @@ impl CommentComposer {
         )
     }
 
+    pub(crate) fn blocked_completion_comment(
+        &self,
+        item: &ProjectItem,
+        completion: &CompletionCheckResult,
+    ) -> String {
+        format!(
+            "{}\n\nImplementation is blocked after completion check.\n\n{}",
+            self.marker(item, ManagedState::Blocked),
+            self.completion_body(completion)
+        )
+    }
+
     pub(crate) fn no_changes_comment(&self, item: &ProjectItem) -> String {
         format!(
             "{}\n\nImplementation produced no repository changes, so no pull request was opened.",
@@ -1100,6 +1234,15 @@ impl CommentComposer {
         self.truncate(&format!(
             "Outcome: {:?}\n\nSummary: {}\n\nFindings:\n{}\n\nQuestions:\n{}",
             review.outcome, review.summary, findings, questions
+        ))
+    }
+
+    fn completion_body(&self, completion: &CompletionCheckResult) -> String {
+        let findings = self.list_or_none(&completion.findings);
+        let questions = self.list_or_none(&completion.questions);
+        self.truncate(&format!(
+            "Outcome: {:?}\n\nSummary: {}\n\nFindings:\n{}\n\nQuestions:\n{}",
+            completion.outcome, completion.summary, findings, questions
         ))
     }
 

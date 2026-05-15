@@ -7,7 +7,8 @@ use tempfile::tempdir;
 use time::OffsetDateTime;
 
 use crate::codex_runner::{
-    AgentRunner, DiscussionReplyDecision, ImplementationResult, SelfReviewOutcome, SelfReviewResult,
+    AgentRunner, CompletionCheckResult, CompletionOutcome, DiscussionReplyDecision,
+    ImplementationResult, SelfReviewOutcome, SelfReviewResult,
 };
 use crate::config::{
     CommandsConfig, Config, GitHubConfig, ReviewConfig, TargetConfig, TokenSource, WorkflowConfig,
@@ -404,6 +405,20 @@ impl AgentRunner for FakeRunner {
         })
     }
 
+    async fn completion_check(
+        &self,
+        _commands: &CommandsConfig,
+        _repo_path: &Path,
+        _prompt: &str,
+    ) -> Result<CompletionCheckResult> {
+        Ok(CompletionCheckResult {
+            outcome: CompletionOutcome::Complete,
+            summary: "complete".to_string(),
+            findings: Vec::new(),
+            questions: Vec::new(),
+        })
+    }
+
     async fn self_review(
         &self,
         _commands: &CommandsConfig,
@@ -422,6 +437,8 @@ impl AgentRunner for FakeRunner {
 #[derive(Clone)]
 struct CapturingRunner {
     prompts: Arc<Mutex<Vec<String>>>,
+    completion_prompts: Arc<Mutex<Vec<String>>>,
+    completion_checks: Arc<Mutex<Vec<CompletionCheckResult>>>,
     discussion_prompts: Arc<Mutex<Vec<String>>>,
     self_review_prompts: Arc<Mutex<Vec<String>>>,
     self_reviews: Arc<Mutex<Vec<SelfReviewResult>>>,
@@ -432,6 +449,13 @@ impl CapturingRunner {
     fn new() -> Self {
         Self {
             prompts: Arc::new(Mutex::new(Vec::new())),
+            completion_prompts: Arc::new(Mutex::new(Vec::new())),
+            completion_checks: Arc::new(Mutex::new(vec![CompletionCheckResult {
+                outcome: CompletionOutcome::Complete,
+                summary: "complete".to_string(),
+                findings: Vec::new(),
+                questions: Vec::new(),
+            }])),
             discussion_prompts: Arc::new(Mutex::new(Vec::new())),
             self_review_prompts: Arc::new(Mutex::new(Vec::new())),
             self_reviews: Arc::new(Mutex::new(vec![SelfReviewResult {
@@ -457,6 +481,10 @@ impl CapturingRunner {
 
     fn set_self_reviews(&self, reviews: Vec<SelfReviewResult>) {
         *self.self_reviews.lock().unwrap() = reviews;
+    }
+
+    fn set_completion_checks(&self, checks: Vec<CompletionCheckResult>) {
+        *self.completion_checks.lock().unwrap() = checks;
     }
 
     fn set_discussion_reply(&self, should_reply: bool, reply: &str) {
@@ -510,6 +538,24 @@ impl AgentRunner for CapturingRunner {
         Ok(self.discussion_reply.lock().unwrap().clone())
     }
 
+    async fn completion_check(
+        &self,
+        _commands: &CommandsConfig,
+        _repo_path: &Path,
+        prompt: &str,
+    ) -> Result<CompletionCheckResult> {
+        self.completion_prompts
+            .lock()
+            .unwrap()
+            .push(prompt.to_string());
+        let mut checks = self.completion_checks.lock().unwrap();
+        if checks.len() > 1 {
+            Ok(checks.remove(0))
+        } else {
+            Ok(checks[0].clone())
+        }
+    }
+
     async fn self_review(
         &self,
         _commands: &CommandsConfig,
@@ -537,6 +583,9 @@ struct FakeWorkspace {
     commit_results: Arc<Mutex<Vec<bool>>>,
     push_failures_remaining: Arc<Mutex<usize>>,
     branch_has_diff: Arc<Mutex<bool>>,
+    local_head: Arc<Mutex<String>>,
+    remote_head: Arc<Mutex<Option<String>>>,
+    uncommitted_changes: Arc<Mutex<bool>>,
 }
 
 impl FakeWorkspace {
@@ -546,6 +595,10 @@ impl FakeWorkspace {
 
     fn fail_next_push(&self) {
         *self.push_failures_remaining.lock().unwrap() += 1;
+    }
+
+    fn leave_uncommitted_changes(&self) {
+        *self.uncommitted_changes.lock().unwrap() = true;
     }
 }
 
@@ -564,23 +617,43 @@ impl WorkspaceManager for FakeWorkspace {
     }
 
     async fn commit_all(&self, _worktree: &Path, _message: &str) -> Result<bool> {
-        *self.committed.lock().unwrap() += 1;
         let committed = {
             let mut results = self.commit_results.lock().unwrap();
             if results.is_empty() {
-                true
+                *self.uncommitted_changes.lock().unwrap() || !*self.branch_has_diff.lock().unwrap()
             } else {
                 results.remove(0)
             }
         };
         if committed {
+            *self.committed.lock().unwrap() += 1;
             *self.branch_has_diff.lock().unwrap() = true;
+            let mut head = self.local_head.lock().unwrap();
+            let next = head
+                .trim_start_matches("HEAD")
+                .parse::<usize>()
+                .unwrap_or(0)
+                + 1;
+            *head = format!("HEAD{next}");
+            *self.uncommitted_changes.lock().unwrap() = false;
         }
         Ok(committed)
     }
 
+    async fn has_uncommitted_changes(&self, _worktree: &Path) -> Result<bool> {
+        Ok(*self.uncommitted_changes.lock().unwrap())
+    }
+
     async fn has_diff_against_base(&self, _worktree: &Path, _base_branch: &str) -> Result<bool> {
         Ok(*self.branch_has_diff.lock().unwrap())
+    }
+
+    async fn head_sha(&self, _worktree: &Path) -> Result<String> {
+        Ok(self.local_head.lock().unwrap().clone())
+    }
+
+    async fn remote_head_sha(&self, _worktree: &Path, _branch: &str) -> Result<Option<String>> {
+        Ok(self.remote_head.lock().unwrap().clone())
     }
 
     async fn push(&self, _worktree: &Path, _branch: &str) -> Result<()> {
@@ -590,6 +663,7 @@ impl WorkspaceManager for FakeWorkspace {
             *failures_remaining -= 1;
             return Err(Error::message("push failed"));
         }
+        *self.remote_head.lock().unwrap() = Some(self.local_head.lock().unwrap().clone());
         Ok(())
     }
 }
@@ -629,6 +703,9 @@ fn fake_workspace(root: &Path) -> FakeWorkspace {
         commit_results: Arc::new(Mutex::new(Vec::new())),
         push_failures_remaining: Arc::new(Mutex::new(0)),
         branch_has_diff: Arc::new(Mutex::new(false)),
+        local_head: Arc::new(Mutex::new("HEAD0".to_string())),
+        remote_head: Arc::new(Mutex::new(None)),
+        uncommitted_changes: Arc::new(Mutex::new(false)),
     }
 }
 
@@ -680,10 +757,12 @@ async fn daemon_does_not_repeat_same_changes_requested_review() {
     assert_eq!(*workspace.committed.lock().unwrap(), 1);
 
     github.request_changes();
+    workspace.leave_uncommitted_changes();
     daemon.run_once().await.unwrap();
     assert_eq!(*workspace.committed.lock().unwrap(), 2);
 
     github.request_changes();
+    workspace.leave_uncommitted_changes();
     daemon.run_once().await.unwrap();
     assert_eq!(*workspace.committed.lock().unwrap(), 3);
 
@@ -771,7 +850,7 @@ async fn self_review_repairs_before_requesting_human_review() {
     github.set_status("In Progress");
     daemon.run_once().await.unwrap();
 
-    assert_eq!(*workspace.committed.lock().unwrap(), 2);
+    assert_eq!(*workspace.committed.lock().unwrap(), 1);
     assert_eq!(github.state.lock().unwrap().prs_marked_ready, 1);
     assert_eq!(
         github.state.lock().unwrap().reviewers_requested,
@@ -789,6 +868,46 @@ async fn self_review_repairs_before_requesting_human_review() {
         .prompts()
         .iter()
         .any(|prompt| prompt.contains("Self-review result")));
+}
+
+#[tokio::test]
+async fn completion_check_continues_work_before_human_review() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let github = FakeGitHub::new(project_item("Todo"), vec![admin_comment()]);
+    let runner = CapturingRunner::new();
+    runner.set_completion_checks(vec![
+        CompletionCheckResult {
+            outcome: CompletionOutcome::NeedsWork,
+            summary: "Half implemented.".to_string(),
+            findings: vec!["Finish the missing path.".to_string()],
+            questions: Vec::new(),
+        },
+        CompletionCheckResult {
+            outcome: CompletionOutcome::Complete,
+            summary: "Complete.".to_string(),
+            findings: Vec::new(),
+            questions: Vec::new(),
+        },
+    ]);
+    let workspace = fake_workspace(temp.path());
+    let daemon =
+        Daemon::with_components(config, github.clone(), runner.clone(), workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    daemon.run_once().await.unwrap();
+
+    assert!(runner
+        .prompts()
+        .iter()
+        .any(|prompt| prompt.contains("Completion check result")));
+    assert_eq!(github.state.lock().unwrap().prs_marked_ready, 1);
+    assert_eq!(
+        github.state.lock().unwrap().reviewers_requested,
+        vec!["reviewer".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -971,6 +1090,7 @@ async fn branch_recovery_handles_old_markers_with_open_pr() {
     daemon.run_once().await.unwrap();
     github.drop_pr_progress_comments();
     github.request_changes();
+    workspace.leave_uncommitted_changes();
     std::fs::remove_file(&state_path).unwrap();
 
     let recovered =

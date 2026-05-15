@@ -26,30 +26,67 @@ If you want to understand the flow first, start with the workflow diagram below.
 
 ```mermaid
 flowchart TD
-  A[Poll Projects v2 items] --> B{Did a write/admin user mention @BOT_LOGIN?}
-  B -- No --> Z[Ignore]
-  B -- Yes --> C[Triage: decide whether this is a code change request]
-  C --> D{Need code changes?}
-  D -- No --> E[Reply with a reason and mark Blocked]
-  D -- Yes --> F{Is the request clear enough?}
-  F -- No --> G[Reply with clarification questions and mark Blocked]
-  F -- Yes --> H[Wait for the Project status to reach start_status]
-  H --> I[Create a branch and a worktree]
-  I --> J[Run codex]
-  J --> K[Run validation commands]
-  K --> L{Did validation pass?}
-  L -- No --> M[Reply with the failure and mark Blocked]
-  L -- Yes --> N[Commit and push]
-  N --> O[Create or reuse a draft PR]
-  O --> P[Run AI self-review]
-  P --> Q{Self-review ready?}
-  Q -- No --> J
-  Q -- Yes --> R[Mark PR ready and request reviewers]
-  R --> T{Does human review request changes?}
-  T -- Yes --> J
-  T -- No --> U{Was the PR merged by a human?}
-  U -- No --> R
-  U -- Yes --> S[Mark the item complete]
+  A[MECH: Poll Projects v2 items] --> B{MECH: Did a write/admin user mention @BOT_LOGIN?}
+  B -- No --> Z[MECH: Ignore]
+  B -- Yes --> C[AI: Triage request]
+  C --> D{AI: Need code changes?}
+  D -- No --> E[MECH: Reply with AI reason and mark Blocked]
+  D -- Yes --> F{AI: Is the request clear enough?}
+  F -- No --> G[MECH: Reply with AI clarification questions and mark Blocked]
+  F -- Yes --> H[MECH: Wait for Project status to reach start_status]
+  H --> HS{MECH: start_status reached?}
+  HS -- Yes --> I[MECH: Create branch and worktree]
+  HS -- No --> HC{MECH: New human comment before start?}
+  HC -- Yes --> DM[AI: Monitor discussion and draft reply]
+  DM --> DR[MECH: Post reply only if AI says needed]
+  DR --> H
+  HC -- No --> H
+  I --> J[AI: Implement with codex]
+  J --> K[MECH: Run validation commands]
+  K --> L{MECH: Did validation pass?}
+  L -- "No, retries remain" --> M[AI: Repair from validation output]
+  M --> K
+  L -- "No, retries exhausted" --> BV[MECH: Mark Blocked with validation failure]
+  L -- Yes --> N[MECH: Commit, push, and verify remote branch]
+  N --> ND{MECH: Branch has changes or existing PR?}
+  ND -- No --> BN[MECH: Mark Blocked with no changes]
+  ND -- Yes --> O[MECH: Create or reuse draft PR]
+  O --> P[AI: Completion check]
+  P --> W{AI: Complete?}
+  W -- "Needs work, retries remain" --> J
+  W -- "Blocked or retries exhausted" --> BC[MECH: Mark Blocked with completion result]
+  W -- Yes --> X[MECH: Finalize local changes and sync PR branch]
+  X --> Q[AI: Self-review]
+  Q --> V{AI: Ready for human review?}
+  V -- "Needs fix, retries remain" --> J
+  V -- "Blocked or retries exhausted" --> BS[MECH: Mark Blocked with self-review result]
+  V -- Yes --> R[MECH: Mark PR ready and request reviewers]
+  R --> HR[HUMAN: Review PR or merge it]
+  HR --> T{MECH: Human review state?}
+  T -- Changes requested --> RF[MECH: Collect trusted review feedback]
+  RF --> J
+  T -- Approved --> U{MECH: PR merged by a human?}
+  T -- No decision yet --> WR[MECH: Wait for review]
+  WR --> T
+  U -- No --> WM[MECH: Wait for merge]
+  WM --> U
+  U -- Yes --> S[MECH: Mark item complete]
+  E --> BH
+  G --> BH[MECH: Wait while Blocked]
+  BV --> BH
+  BN --> BH
+  BC --> BH
+  BS --> BH
+  BH --> BHC{MECH: New human comment?}
+  BHC -- Yes --> DM
+  BHC -- No --> BH
+
+  classDef ai fill:#e7f0ff,stroke:#2f6fed,color:#12233f;
+  classDef mech fill:#eef8f1,stroke:#268a46,color:#102a18;
+  classDef human fill:#fff4df,stroke:#b66a00,color:#3a2500;
+  class C,D,F,DM,J,M,P,W,Q,V ai;
+  class A,B,Z,E,G,H,HC,DR,HS,I,K,L,BV,N,ND,BN,O,X,R,BC,BS,T,RF,WR,U,WM,S,BH,BHC mech;
+  class HR human;
 ```
 
 ## What It Does
@@ -81,6 +118,7 @@ Autono first confirms the request, then moves through implementation phases.
 5. **Review**
    - After validation passes, Autono commits and pushes the changes
    - It creates or reuses a draft PR
+   - It checks whether the implementation is complete, finalizes local changes, and verifies the remote PR branch matches the local branch
    - It runs an AI self-review, posts the self-review result to the PR, and fixes findings before human review
    - Once self-review passes, it posts `Review Ready`, marks the PR ready for review, and requests reviewers
    - If human review requests changes, Autono continues on the same branch and worktree, replies to active review threads, resolves them after the fix lands, and repeats the self-review gate before asking humans again

@@ -92,6 +92,30 @@ impl GitWorkspace {
         Ok(output.status_code == Some(0))
     }
 
+    async fn current_head_sha(&self, worktree: &Path) -> Result<String> {
+        let output = self.git(worktree, &["rev-parse", "HEAD"]).await?;
+        output.ensure_success("git rev-parse HEAD")?;
+        Ok(output.stdout.trim().to_string())
+    }
+
+    async fn remote_branch_head_sha(
+        &self,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let ref_name = format!("refs/heads/{branch}");
+        let output = self
+            .git(worktree, &["ls-remote", "origin", &ref_name])
+            .await?;
+        output.ensure_success("git ls-remote")?;
+        Ok(output
+            .stdout
+            .split_whitespace()
+            .next()
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string))
+    }
+
     async fn git(&self, working_dir: &Path, args: &[&str]) -> Result<CommandOutput> {
         CommandRunner::new(working_dir).git(args).await
     }
@@ -137,7 +161,10 @@ pub trait WorkspaceManager: Send + Sync {
     fn identity(&self, target: &TargetConfig, item_id: &str, title: &str) -> WorkIdentity;
     async fn ensure_worktree(&self, target: &TargetConfig, identity: &WorkIdentity) -> Result<()>;
     async fn commit_all(&self, worktree: &Path, message: &str) -> Result<bool>;
+    async fn has_uncommitted_changes(&self, worktree: &Path) -> Result<bool>;
     async fn has_diff_against_base(&self, worktree: &Path, base_branch: &str) -> Result<bool>;
+    async fn head_sha(&self, worktree: &Path) -> Result<String>;
+    async fn remote_head_sha(&self, worktree: &Path, branch: &str) -> Result<Option<String>>;
     async fn push(&self, worktree: &Path, branch: &str) -> Result<()>;
 }
 
@@ -202,9 +229,21 @@ impl WorkspaceManager for GitWorkspace {
         Ok(true)
     }
 
+    async fn has_uncommitted_changes(&self, worktree: &Path) -> Result<bool> {
+        self.has_changes(worktree).await
+    }
+
     async fn has_diff_against_base(&self, worktree: &Path, base_branch: &str) -> Result<bool> {
         self.branch_has_diff_against_base(worktree, base_branch)
             .await
+    }
+
+    async fn head_sha(&self, worktree: &Path) -> Result<String> {
+        self.current_head_sha(worktree).await
+    }
+
+    async fn remote_head_sha(&self, worktree: &Path, branch: &str) -> Result<Option<String>> {
+        self.remote_branch_head_sha(worktree, branch).await
     }
 
     async fn push(&self, worktree: &Path, branch: &str) -> Result<()> {

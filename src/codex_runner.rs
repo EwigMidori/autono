@@ -7,8 +7,8 @@ use crate::config::CommandsConfig;
 use crate::error::{OptionContext, Result, ResultContext};
 use crate::git_workspace::{CommandOutput, CommandRunner};
 use crate::prompt_templates::{
-    render as render_template, DISCUSSION_MONITOR, IMPLEMENTATION, IMPLEMENTATION_REPAIR,
-    SELF_REVIEW, SELF_REVIEW_REPAIR, TRIAGE,
+    render as render_template, COMPLETION_CHECK, COMPLETION_REPAIR, DISCUSSION_MONITOR,
+    IMPLEMENTATION, IMPLEMENTATION_REPAIR, SELF_REVIEW, SELF_REVIEW_REPAIR, TRIAGE,
 };
 use crate::workflow::TriageResult;
 
@@ -56,6 +56,26 @@ pub struct DiscussionReplyDecision {
     pub should_reply: bool,
     #[serde(default)]
     pub reply: String,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionOutcome {
+    Complete,
+    NeedsWork,
+    Blocked,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CompletionCheckResult {
+    pub outcome: CompletionOutcome,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub questions: Vec<String>,
 }
 
 #[non_exhaustive]
@@ -142,6 +162,12 @@ pub trait AgentRunner: Send + Sync {
         repo_path: &Path,
         prompt: &str,
     ) -> Result<ImplementationResult>;
+    async fn completion_check(
+        &self,
+        commands: &CommandsConfig,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> Result<CompletionCheckResult>;
     async fn self_review(
         &self,
         commands: &CommandsConfig,
@@ -192,6 +218,19 @@ impl AgentRunner for CodexRunner {
                 .to_string(),
             tests_run: Vec::new(),
         })
+    }
+
+    async fn completion_check(
+        &self,
+        commands: &CommandsConfig,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> Result<CompletionCheckResult> {
+        let output = self.run(commands, repo_path, prompt).await?;
+        let json_slice = self
+            .json_object(&output.stdout)
+            .context("codex completion-check output did not contain a JSON object")?;
+        serde_json::from_str(json_slice).context("failed to parse codex completion-check JSON")
     }
 
     async fn self_review(
@@ -332,6 +371,37 @@ impl ImplementationPrompt {
         )
     }
 
+    pub(crate) fn render_completion_check(&self) -> String {
+        let summary = truncate_end(&self.summary, PROMPT_SECTION_LIMIT);
+        let discussion = truncate_end(&self.discussion, PROMPT_SECTION_LIMIT);
+        let tests = if self.tests.is_empty() {
+            "(none configured)".to_string()
+        } else {
+            truncate_end(&self.tests.join("\n"), PROMPT_SECTION_LIMIT)
+        };
+        render_template(
+            COMPLETION_CHECK,
+            &[
+                ("summary", &summary),
+                ("discussion", &discussion),
+                ("tests", &tests),
+            ],
+        )
+    }
+
+    pub(crate) fn render_completion_repair(&self, result: &CompletionCheckResult) -> String {
+        let base_prompt = self.render();
+        let completion_result = result.to_prompt_text();
+        let completion_result = truncate_end(&completion_result, PROMPT_SECTION_LIMIT);
+        render_template(
+            COMPLETION_REPAIR,
+            &[
+                ("base_prompt", &base_prompt),
+                ("completion_result", &completion_result),
+            ],
+        )
+    }
+
     pub(crate) fn render_self_review(&self) -> String {
         let summary = truncate_end(&self.summary, PROMPT_SECTION_LIMIT);
         let discussion = truncate_end(&self.discussion, PROMPT_SECTION_LIMIT);
@@ -364,30 +434,50 @@ impl ImplementationPrompt {
     }
 }
 
+impl CompletionCheckResult {
+    pub(crate) fn to_prompt_text(&self) -> String {
+        prompt_result_text(
+            &format!("{:?}", self.outcome),
+            &self.summary,
+            &self.findings,
+            &self.questions,
+        )
+    }
+}
+
 impl SelfReviewResult {
     pub(crate) fn to_prompt_text(&self) -> String {
-        let findings = if self.findings.is_empty() {
-            "- None".to_string()
-        } else {
-            self.findings
-                .iter()
-                .map(|finding| format!("- {finding}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let questions = if self.questions.is_empty() {
-            "- None".to_string()
-        } else {
-            self.questions
-                .iter()
-                .map(|question| format!("- {question}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        format!(
-            "Outcome: {:?}\nSummary: {}\nFindings:\n{}\nQuestions:\n{}",
-            self.outcome, self.summary, findings, questions
+        prompt_result_text(
+            &format!("{:?}", self.outcome),
+            &self.summary,
+            &self.findings,
+            &self.questions,
         )
+    }
+}
+
+fn prompt_result_text(
+    outcome: &str,
+    summary: &str,
+    findings: &[String],
+    questions: &[String],
+) -> String {
+    let findings = list_or_none(findings);
+    let questions = list_or_none(questions);
+    format!(
+        "Outcome: {outcome}\nSummary: {summary}\nFindings:\n{findings}\nQuestions:\n{questions}"
+    )
+}
+
+fn list_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "- None".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
