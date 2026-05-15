@@ -6,6 +6,9 @@ use serde::Deserialize;
 use crate::config::CommandsConfig;
 use crate::error::{OptionContext, Result, ResultContext};
 use crate::git_workspace::{CommandOutput, CommandRunner};
+use crate::prompt_templates::{
+    render as render_template, DISCUSSION_MONITOR, IMPLEMENTATION, IMPLEMENTATION_REPAIR, TRIAGE,
+};
 use crate::workflow::TriageResult;
 
 const PROMPT_SECTION_LIMIT: usize = 200_000;
@@ -239,27 +242,13 @@ impl TriagePrompt {
         let title = truncate_end(&self.title, PROMPT_SECTION_LIMIT);
         let body = truncate_end(&self.body, PROMPT_SECTION_LIMIT);
         let comments = truncate_end(&self.comments, PROMPT_SECTION_LIMIT);
-        format!(
-            r#"You are triaging a GitHub project item for an autonomous coding daemon.
-
-Return a single JSON object with this shape:
-{{"is_code_change":true,"confidence":0.0,"summary":"...","questions":[],"risks":[]}}
-
-Rules:
-- Set is_code_change to true only when the request needs repository code/config/docs changes.
-- Ask concise clarification questions when the implementation is ambiguous.
-- Do not modify files during triage.
-
-Title:
-{}
-
-Body:
-{}
-
-Discussion:
-{}
-"#,
-            title, body, comments
+        render_template(
+            TRIAGE,
+            &[
+                ("title", &title),
+                ("body", &body),
+                ("discussion", &comments),
+            ],
         )
     }
 }
@@ -281,29 +270,25 @@ impl ImplementationPrompt {
         } else {
             truncate_end(&self.tests.join("\n"), PROMPT_SECTION_LIMIT)
         };
-        format!(
-            r#"Implement this GitHub task in the current repository worktree.
-
-Requirement summary:
-{}
-
-Discussion:
-{}
-
-After editing, make commits unnecessary; the daemon will commit all changes.
-Expected validation commands:
-{}
-"#,
-            summary, discussion, tests
+        render_template(
+            IMPLEMENTATION,
+            &[
+                ("summary", &summary),
+                ("discussion", &discussion),
+                ("tests", &tests),
+            ],
         )
     }
 
     pub(crate) fn render_repair(&self, validation_output: &str) -> String {
         let validation_output = truncate_start(validation_output, VALIDATION_OUTPUT_PROMPT_LIMIT);
-        format!(
-            "{}\n\nThe previous validation failed. Fix the repository based on this output:\n{}",
-            self.render(),
-            validation_output
+        let base_prompt = self.render();
+        render_template(
+            IMPLEMENTATION_REPAIR,
+            &[
+                ("base_prompt", &base_prompt),
+                ("validation_output", &validation_output),
+            ],
         )
     }
 }
@@ -330,39 +315,18 @@ impl DiscussionPrompt {
         let title = truncate_end(&self.title, PROMPT_SECTION_LIMIT);
         let body = truncate_end(&self.body, PROMPT_SECTION_LIMIT);
         let discussion = truncate_end(&self.discussion, PROMPT_SECTION_LIMIT);
-        format!(
-            r#"You are monitoring a GitHub issue discussion for an autonomous coding daemon.
-
-Return a single JSON object with this shape:
-{{"should_reply":true,"reply":"..."}}
-
-Rules:
-- Decide whether the thread needs a user-facing reply right now.
-- If no reply is needed, set should_reply to false and reply to an empty string.
-- If a reply is needed, keep it short, concrete, and directly tied to the latest discussion.
-- Do not edit files.
-- Treat this checkout as read-only reference only:
-  {}
-- The base branch for reference is `{}`.
-- The daemon is currently in state `{}`.
-- The task should not start implementation until the Project status becomes `{}`.
-
-Title:
-{}
-
-Body:
-{}
-
-Discussion:
-{}
-"#,
-            self.readonly_checkout.display(),
-            self.base_branch,
-            self.state,
-            self.start_status,
-            title,
-            body,
-            discussion
+        let readonly_checkout = self.readonly_checkout.display().to_string();
+        render_template(
+            DISCUSSION_MONITOR,
+            &[
+                ("readonly_checkout", &readonly_checkout),
+                ("base_branch", &self.base_branch),
+                ("state", &self.state),
+                ("start_status", &self.start_status),
+                ("title", &title),
+                ("body", &body),
+                ("discussion", &discussion),
+            ],
         )
     }
 }

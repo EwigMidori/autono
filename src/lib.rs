@@ -7,6 +7,7 @@ mod error;
 mod git_workspace;
 mod github;
 mod github_types;
+pub(crate) mod prompt_templates;
 mod review_feedback;
 mod store;
 mod workflow;
