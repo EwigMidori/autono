@@ -6,10 +6,6 @@ use async_trait::async_trait;
 use tempfile::tempdir;
 use time::OffsetDateTime;
 
-use crate::codex_runner::{
-    AgentRunner, CompletionCheckResult, CompletionOutcome, DiscussionReplyDecision,
-    ImplementationResult, SelfReviewOutcome, SelfReviewResult,
-};
 use crate::config::{
     CommandsConfig, Config, GitHubConfig, ReviewConfig, TargetConfig, WorkflowConfig,
 };
@@ -19,6 +15,10 @@ use crate::git_workspace::{WorkIdentity, WorkspaceManager};
 use crate::github::{
     GitHub, NewPullRequest, ProjectContent, ProjectContentKind, ProjectItem, PullRequestInfo,
     ReviewThread, ReviewThreadComment,
+};
+use crate::runner::codex::{
+    AgentRunner, CompletionCheckResult, CompletionOutcome, DiscussionReplyDecision,
+    ImplementationResult, SelfReviewOutcome, SelfReviewResult,
 };
 use crate::store::Store;
 use crate::workflow::{CommentView, ManagedState, ReviewDecision, TriageResult};

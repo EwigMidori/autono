@@ -1,5 +1,4 @@
 use std::convert::TryFrom;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,105 +8,39 @@ use octocrab::{GraphqlResponse, Octocrab, Page};
 use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::process::Command;
-use tokio::time as tokio_time;
 
-use crate::config::{GitHubConfig, TargetConfig, TokenSource};
+use crate::config::{GitHubConfig, TargetConfig};
 use crate::error::{Error, OptionContext, Result, ResultContext};
+mod auth;
+mod models;
+mod review_state;
+
 use crate::github_types::{
-    ProjectItemsResponse, ProjectStatusFieldResponse, PullRequestReviewDecisionValue,
-    PullRequestReviewNode, PullRequestReviewStateResponse, PullRequestReviewStateValue,
+    ProjectItemsResponse, ProjectStatusFieldResponse, PullRequestReviewStateResponse,
     PullRequestReviewThreadsResponse, ResolveProjectResponse, ReviewThreadCommentsResponse,
     CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION, MARK_PULL_REQUEST_READY_MUTATION, PROJECT_ITEMS_QUERY,
     PROJECT_STATUS_FIELD_QUERY, PULL_REQUEST_REVIEW_STATE_QUERY, RESOLVE_PROJECT_QUERY,
     REVIEW_THREADS_QUERY, REVIEW_THREAD_COMMENTS_QUERY, UPDATE_PROJECT_FIELD_MUTATION,
 };
 use crate::workflow::{CommentView, ReviewDecision};
+pub use models::{
+    NewPullRequest, ProjectContent, ProjectContentKind, ProjectItem, PullRequestInfo, ReviewThread,
+    ReviewThreadComment,
+};
+use review_state::ReviewState;
+use review_state::{review_decision_from_github, review_state_for_decision};
 
 const MAX_GRAPHQL_PAGES: usize = 100;
 const MAX_REST_PAGES: usize = 100;
 const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
     octo: Octocrab,
     graphql_url: String,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct ProjectItem {
-    pub id: String,
-    pub title: String,
-    pub status: Option<String>,
-    pub content: Option<ProjectContent>,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct ProjectContent {
-    pub id: String,
-    pub number: i64,
-    pub title: String,
-    pub body: String,
-    pub author: String,
-    pub created_at: OffsetDateTime,
-    pub url: String,
-    pub kind: ProjectContentKind,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectContentKind {
-    Issue,
-    PullRequest,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct PullRequestInfo {
-    pub number: i64,
-    pub node_id: String,
-    pub head_sha: String,
-    pub merged: bool,
-    pub is_draft: bool,
-    pub review_decision: ReviewDecision,
-    pub latest_review_id: Option<i64>,
-    pub latest_review_body: Option<String>,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct NewPullRequest {
-    pub title: String,
-    pub body: String,
-    pub head: String,
-    pub base: String,
-    pub draft: bool,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct ReviewThread {
-    pub id: String,
-    pub is_resolved: bool,
-    pub is_outdated: bool,
-    pub path: String,
-    pub line: Option<i64>,
-    pub original_line: Option<i64>,
-    pub comments: Vec<ReviewThreadComment>,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct ReviewThreadComment {
-    pub author: String,
-    pub body: String,
-    pub diff_hunk: String,
-    pub html_url: String,
 }
 
 #[async_trait]
@@ -170,7 +103,7 @@ pub trait GitHub: Send + Sync {
 
 impl GitHubClient {
     pub async fn from_config(config: &GitHubConfig) -> Result<Self> {
-        let token = GitHubAuthenticator::new(&config.token_source)
+        let token = auth::GitHubAuthenticator::new(&config.token_source)
             .token()
             .await?;
         let octo = Octocrab::builder()
@@ -302,72 +235,6 @@ impl GitHubClient {
             decision.unwrap_or(ReviewDecision::None),
             reviews,
         ))
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-struct ReviewState {
-    decision: ReviewDecision,
-    review_id: Option<i64>,
-    review_body: Option<String>,
-}
-
-impl ReviewState {
-    fn new(decision: ReviewDecision, review_id: Option<i64>, review_body: Option<String>) -> Self {
-        Self {
-            decision,
-            review_id,
-            review_body,
-        }
-    }
-}
-
-fn review_decision_from_github(decision: Option<PullRequestReviewDecisionValue>) -> ReviewDecision {
-    match decision {
-        Some(PullRequestReviewDecisionValue::Approved) => ReviewDecision::Approved,
-        Some(PullRequestReviewDecisionValue::ChangesRequested) => ReviewDecision::ChangesRequested,
-        Some(PullRequestReviewDecisionValue::ReviewRequired) | None => ReviewDecision::None,
-    }
-}
-
-fn review_state_for_decision(
-    decision: ReviewDecision,
-    reviews: Vec<PullRequestReviewNode>,
-) -> ReviewState {
-    let Some(wanted_state) = opinionated_review_state(decision) else {
-        return ReviewState::new(decision, None, None);
-    };
-    let latest_review = reviews
-        .into_iter()
-        .filter(|review| review.state == wanted_state)
-        .max_by(|left, right| {
-            left.submitted_at
-                .cmp(&right.submitted_at)
-                .then_with(|| left.full_database_id.cmp(&right.full_database_id))
-        });
-    ReviewState::new(
-        decision,
-        latest_review
-            .as_ref()
-            .and_then(|review| review.full_database_id),
-        latest_review.and_then(|review| non_empty_review_body(review.body)),
-    )
-}
-
-fn opinionated_review_state(decision: ReviewDecision) -> Option<PullRequestReviewStateValue> {
-    match decision {
-        ReviewDecision::Approved => Some(PullRequestReviewStateValue::Approved),
-        ReviewDecision::ChangesRequested => Some(PullRequestReviewStateValue::ChangesRequested),
-        ReviewDecision::None => None,
-    }
-}
-
-fn non_empty_review_body(body: String) -> Option<String> {
-    if body.trim().is_empty() {
-        None
-    } else {
-        Some(body)
     }
 }
 
@@ -805,45 +672,6 @@ impl GitHubClient {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct GitHubAuthenticator<'a> {
-    source: &'a TokenSource,
-}
-
-impl<'a> GitHubAuthenticator<'a> {
-    fn new(source: &'a TokenSource) -> Self {
-        Self { source }
-    }
-
-    async fn token(&self) -> Result<String> {
-        match self.source {
-            TokenSource::Gh => self.gh_token().await,
-        }
-    }
-
-    async fn gh_token(&self) -> Result<String> {
-        let mut command = Command::new("gh");
-        command
-            .args(["auth", "token"])
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        let output = tokio_time::timeout(GH_TOKEN_TIMEOUT, command.output())
-            .await
-            .map_err(|_| Error::timeout("gh auth token exceeded 30 seconds"))?
-            .context("failed to run gh auth token")?;
-        if !output.status.success() {
-            return Err(Error::message(format!(
-                "gh auth token failed with status {}",
-                output.status
-            )));
-        }
-        Ok(String::from_utf8(output.stdout)
-            .context("gh auth token output was not UTF-8")?
-            .trim()
-            .to_string())
-    }
-}
-
 impl ReviewThread {
     pub(crate) fn line_label(&self) -> String {
         match (self.line, self.original_line) {
@@ -875,6 +703,7 @@ fn is_not_found(err: &octocrab::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github_types::{PullRequestReviewNode, PullRequestReviewStateValue};
 
     fn review(
         id: i64,
