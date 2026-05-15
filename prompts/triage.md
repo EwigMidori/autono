@@ -9,10 +9,16 @@ Rules:
 - Do not modify files during triage.
 
 Title:
+<title>
 {{title}}
+</title>
 
 Body:
+<body>
 {{body}}
+</body>
 
 Discussion:
+<discussion>
 {{discussion}}
+</discussion>

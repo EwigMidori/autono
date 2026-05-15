@@ -610,7 +610,7 @@ mod tests {
 
         assert!(rendered.contains("[truncated"));
         assert!(rendered.contains("tail"));
-        assert!(rendered.len() < prompt.render().len() + validation_output.len());
+        assert!(!rendered.contains(&"a".repeat(VALIDATION_OUTPUT_PROMPT_LIMIT + 100)));
     }
 
     #[test]

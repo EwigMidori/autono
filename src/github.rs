@@ -817,7 +817,6 @@ impl<'a> GitHubAuthenticator<'a> {
 
     async fn token(&self) -> Result<String> {
         match self.source {
-            TokenSource::Env => std::env::var("GITHUB_TOKEN").context("GITHUB_TOKEN is not set"),
             TokenSource::Gh => self.gh_token().await,
         }
     }

@@ -9,7 +9,7 @@ type(scope): subject
 Example:
 
 ```text
-feat(refaco): rewrite the English documentation
+docs(readme): rewrite the English documentation
 ```
 
 To enable the hook in this clone:

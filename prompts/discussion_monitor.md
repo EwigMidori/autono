@@ -5,6 +5,8 @@ Return a single JSON object with this shape:
 
 Rules:
 - Decide whether the thread needs a user-facing reply right now.
+- Reply when the latest human comment changes requirements, asks a direct question, answers a prior blocker, or makes the implementation plan ambiguous.
+- Do not reply when the latest human comment is just acknowledgement, status chatter, or unrelated discussion that does not change the task.
 - If no reply is needed, set should_reply to false and reply to an empty string.
 - If a reply is needed, keep it short, concrete, and directly tied to the latest discussion.
 - Do not edit files.
@@ -15,10 +17,16 @@ Rules:
 - The task should not start implementation until the Project status becomes `{{start_status}}`.
 
 Title:
+<title>
 {{title}}
+</title>
 
 Body:
+<body>
 {{body}}
+</body>
 
 Discussion:
+<discussion>
 {{discussion}}
+</discussion>

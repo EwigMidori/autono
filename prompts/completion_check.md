@@ -1,13 +1,19 @@
 Check whether the current repository worktree fully completes this GitHub task.
 
 Task summary:
+<summary>
 {{summary}}
+</summary>
 
 Discussion and review context:
+<discussion>
 {{discussion}}
+</discussion>
 
 Expected validation commands:
+<validation_commands>
 {{tests}}
+</validation_commands>
 
 Rules:
 - Inspect the current worktree and implemented diff against the task discussion.

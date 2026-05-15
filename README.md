@@ -11,6 +11,8 @@ Its user-facing workflow is simple:
 
 Autono handles the implementation steps in the middle, so the user can stay in GitHub for requirements, progress, and code review.
 
+On `run` and `once`, Autono performs a startup preflight before contacting GitHub. It checks local directories and configured commands so missing checkouts, state directories, or tools fail fast.
+
 If you want the full Chinese documentation, see [`docs/README.zh-CN.md`](docs/README.zh-CN.md).
 
 It is designed for teams that want:
@@ -162,6 +164,7 @@ Use a TOML file such as [`autono.example.toml`](autono.example.toml).
 - `poll_interval_secs`: polling interval
 - `worktrees_root`: worktree root directory
 - `state_path`: SQLite state file path
+- `max_fix_attempts_limit`: upper bound allowed for any target's `commands.max_fix_attempts`
 - `[github]`: GitHub API and token source settings
 - `[[targets]]`: one or more repository / project targets
 
@@ -199,6 +202,7 @@ bot_login = "your-bot-login"
 poll_interval_secs = 60
 worktrees_root = "/srv/autono/worktrees"
 state_path = "/srv/autono/state.sqlite3"
+max_fix_attempts_limit = 10
 
 [github]
 token_source = "gh"
@@ -265,8 +269,6 @@ Recover or rebuild the local state for a single item.
 
 ## GitHub Token
 
-Autono supports two token sources.
-
 ### `token_source = "gh"`
 
 Uses the `gh` login session. The session needs repository and Projects permissions:
@@ -274,15 +276,6 @@ Uses the `gh` login session. The session needs repository and Projects permissio
 ```sh
 gh auth refresh -s repo -s read:project -s project
 ```
-
-### `token_source = "env"`
-
-Uses the `GITHUB_TOKEN` environment variable.
-
-Required steps:
-
-- Set `GITHUB_TOKEN`
-- Change `token_source` to `env`
 
 ## Local State
 

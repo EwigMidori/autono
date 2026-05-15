@@ -9,5 +9,5 @@ if printf '%s\n' "$first_line" | grep -Eq '^(feat|fix|chore|docs|refactor|test|c
 fi
 
 echo "commit message must use: type(scope): subject"
-echo "example: feat(refaco): rewrite the English documentation"
+echo "example: docs(readme): rewrite the English documentation"
 exit 1

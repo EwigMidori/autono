@@ -2,6 +2,7 @@ bot_login = "your-bot-login"
 poll_interval_secs = 60
 worktrees_root = "/srv/autono/worktrees"
 state_path = "/srv/autono/state.sqlite3"
+max_fix_attempts_limit = 10
 
 [github]
 token_source = "gh"

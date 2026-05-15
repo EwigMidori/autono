@@ -8,4 +8,6 @@ Example:
 `gh api graphql -F threadId=<THREAD_ID> -F body='<reply>' -f query='mutation($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) { comment { id } } }'`
 `gh api graphql -F threadId=<THREAD_ID> -f query='mutation($threadId: ID!) { resolveReviewThread(input: { threadId: $threadId }) { thread { id isResolved } } }'`
 
+<review_threads>
 {{thread_sections}}
+</review_threads>

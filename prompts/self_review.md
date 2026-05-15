@@ -1,13 +1,19 @@
 Review the current repository worktree before this pull request is sent to human reviewers.
 
 Task summary:
+<summary>
 {{summary}}
+</summary>
 
 Discussion and review context:
+<discussion>
 {{discussion}}
+</discussion>
 
 Expected validation commands:
+<validation_commands>
 {{tests}}
+</validation_commands>
 
 Rules:
 - Inspect the implemented diff against the base branch and the task discussion.

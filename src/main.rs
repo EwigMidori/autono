@@ -72,12 +72,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => {
             let config = Config::load(&args.config)?;
+            config.preflight_check()?;
             let github = GitHubClient::from_config(config.github_config()).await?;
             Daemon::new(config, github)?.run_forever().await?;
             Ok(())
         }
         Command::Once(args) => {
             let config = Config::load(&args.config)?;
+            config.preflight_check()?;
             let github = GitHubClient::from_config(config.github_config()).await?;
             Daemon::new(config, github)?.run_once().await?;
             Ok(())

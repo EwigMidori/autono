@@ -1,10 +1,14 @@
 Fix the current repository worktree based on this AI self-review.
 
 Original implementation prompt:
+<base_prompt>
 {{base_prompt}}
+</base_prompt>
 
 Self-review result:
+<self_review_result>
 {{review_result}}
+</self_review_result>
 
 Rules:
 - Address the self-review findings directly.

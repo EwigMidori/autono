@@ -915,12 +915,26 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             .has_diff_against_base(&identity.worktree_path, target.base_branch())
             .await?;
         if branch_has_changes {
-            if !self.remote_matches_head(identity).await? {
+            let head = self.workspace.head_sha(&identity.worktree_path).await?;
+            let remote = self
+                .workspace
+                .remote_head_sha(&identity.worktree_path, &identity.branch)
+                .await?;
+            if remote.as_deref() != Some(head.as_str()) {
                 self.workspace
                     .push(&identity.worktree_path, &identity.branch)
                     .await?;
             }
-            self.ensure_remote_matches_head(identity).await?;
+            let synced_remote = self
+                .workspace
+                .remote_head_sha(&identity.worktree_path, &identity.branch)
+                .await?;
+            if synced_remote.as_deref() != Some(head.as_str()) {
+                return Err(Error::message(format!(
+                    "remote branch {} is not synchronized with local HEAD {}",
+                    identity.branch, head
+                )));
+            }
         }
         if self
             .workspace
@@ -933,26 +947,6 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             )));
         }
         Ok(branch_has_changes)
-    }
-
-    async fn ensure_remote_matches_head(&self, identity: &WorkIdentity) -> Result<()> {
-        if self.remote_matches_head(identity).await? {
-            return Ok(());
-        }
-        let head = self.workspace.head_sha(&identity.worktree_path).await?;
-        Err(Error::message(format!(
-            "remote branch {} is not synchronized with local HEAD {}",
-            identity.branch, head
-        )))
-    }
-
-    async fn remote_matches_head(&self, identity: &WorkIdentity) -> Result<bool> {
-        let head = self.workspace.head_sha(&identity.worktree_path).await?;
-        let remote = self
-            .workspace
-            .remote_head_sha(&identity.worktree_path, &identity.branch)
-            .await?;
-        Ok(remote.as_deref() == Some(head.as_str()))
     }
 
     async fn complete(

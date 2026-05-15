@@ -11,7 +11,7 @@ use crate::codex_runner::{
     ImplementationResult, SelfReviewOutcome, SelfReviewResult,
 };
 use crate::config::{
-    CommandsConfig, Config, GitHubConfig, ReviewConfig, TargetConfig, TokenSource, WorkflowConfig,
+    CommandsConfig, Config, GitHubConfig, ReviewConfig, TargetConfig, WorkflowConfig,
 };
 use crate::daemon::{CommentComposer, Daemon};
 use crate::error::{Error, Result};
@@ -60,10 +60,11 @@ fn config(root: &Path, target: TargetConfig) -> Config {
         worktrees_root: root.join("worktrees"),
         state_path: Some(root.join("state.sqlite3")),
         github: GitHubConfig {
-            token_source: TokenSource::Env,
+            token_source: crate::config::TokenSource::Gh,
             api_url: "https://api.github.com".to_string(),
             graphql_url: "https://api.github.com/graphql".to_string(),
         },
+        max_fix_attempts_limit: 10,
         targets: vec![target],
     }
 }
