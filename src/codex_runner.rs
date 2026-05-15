@@ -7,7 +7,8 @@ use crate::config::CommandsConfig;
 use crate::error::{OptionContext, Result, ResultContext};
 use crate::git_workspace::{CommandOutput, CommandRunner};
 use crate::prompt_templates::{
-    render as render_template, DISCUSSION_MONITOR, IMPLEMENTATION, IMPLEMENTATION_REPAIR, TRIAGE,
+    render as render_template, DISCUSSION_MONITOR, IMPLEMENTATION, IMPLEMENTATION_REPAIR,
+    SELF_REVIEW, SELF_REVIEW_REPAIR, TRIAGE,
 };
 use crate::workflow::TriageResult;
 
@@ -55,6 +56,26 @@ pub struct DiscussionReplyDecision {
     pub should_reply: bool,
     #[serde(default)]
     pub reply: String,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfReviewOutcome {
+    Ready,
+    NeedsFix,
+    Blocked,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SelfReviewResult {
+    pub outcome: SelfReviewOutcome,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub questions: Vec<String>,
 }
 
 #[non_exhaustive]
@@ -121,6 +142,12 @@ pub trait AgentRunner: Send + Sync {
         repo_path: &Path,
         prompt: &str,
     ) -> Result<ImplementationResult>;
+    async fn self_review(
+        &self,
+        commands: &CommandsConfig,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> Result<SelfReviewResult>;
 }
 
 #[async_trait]
@@ -165,6 +192,19 @@ impl AgentRunner for CodexRunner {
                 .to_string(),
             tests_run: Vec::new(),
         })
+    }
+
+    async fn self_review(
+        &self,
+        commands: &CommandsConfig,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> Result<SelfReviewResult> {
+        let output = self.run(commands, repo_path, prompt).await?;
+        let json_slice = self
+            .json_object(&output.stdout)
+            .context("codex self-review output did not contain a JSON object")?;
+        serde_json::from_str(json_slice).context("failed to parse codex self-review JSON")
     }
 }
 
@@ -289,6 +329,64 @@ impl ImplementationPrompt {
                 ("base_prompt", &base_prompt),
                 ("validation_output", &validation_output),
             ],
+        )
+    }
+
+    pub(crate) fn render_self_review(&self) -> String {
+        let summary = truncate_end(&self.summary, PROMPT_SECTION_LIMIT);
+        let discussion = truncate_end(&self.discussion, PROMPT_SECTION_LIMIT);
+        let tests = if self.tests.is_empty() {
+            "(none configured)".to_string()
+        } else {
+            truncate_end(&self.tests.join("\n"), PROMPT_SECTION_LIMIT)
+        };
+        render_template(
+            SELF_REVIEW,
+            &[
+                ("summary", &summary),
+                ("discussion", &discussion),
+                ("tests", &tests),
+            ],
+        )
+    }
+
+    pub(crate) fn render_self_review_repair(&self, review_result: &SelfReviewResult) -> String {
+        let base_prompt = self.render();
+        let review_result = review_result.to_prompt_text();
+        let review_result = truncate_end(&review_result, PROMPT_SECTION_LIMIT);
+        render_template(
+            SELF_REVIEW_REPAIR,
+            &[
+                ("base_prompt", &base_prompt),
+                ("review_result", &review_result),
+            ],
+        )
+    }
+}
+
+impl SelfReviewResult {
+    pub(crate) fn to_prompt_text(&self) -> String {
+        let findings = if self.findings.is_empty() {
+            "- None".to_string()
+        } else {
+            self.findings
+                .iter()
+                .map(|finding| format!("- {finding}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let questions = if self.questions.is_empty() {
+            "- None".to_string()
+        } else {
+            self.questions
+                .iter()
+                .map(|question| format!("- {question}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "Outcome: {:?}\nSummary: {}\nFindings:\n{}\nQuestions:\n{}",
+            self.outcome, self.summary, findings, questions
         )
     }
 }

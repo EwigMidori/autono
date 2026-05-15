@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::codex_runner::{
     AgentRunner, CodexRunner, DiscussionPrompt, DiscussionPromptContext, ImplementationPrompt,
-    TriagePrompt, ValidationRunner,
+    SelfReviewOutcome, SelfReviewResult, TriagePrompt, ValidationRunner,
 };
 use crate::config::{Config, TargetConfig};
 use crate::error::{Result, ResultContext};
@@ -41,6 +41,16 @@ struct WorkRequest<'a> {
     handled_review_id: Option<i64>,
     review_body: Option<String>,
     pr_number: Option<i64>,
+}
+
+#[derive(Debug)]
+struct SelfReviewRequest<'a, 'b> {
+    work: WorkRequest<'a>,
+    identity: &'b WorkIdentity,
+    store_key: StoreItemKey<'b>,
+    pr: crate::github::PullRequestInfo,
+    prompt: &'b ImplementationPrompt,
+    validation: &'b ValidationRunner,
 }
 
 #[derive(Debug)]
@@ -192,15 +202,15 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         let stored_state = stored.as_ref().map(|stored| stored.state);
         let managed_state = if active_pr.is_some() {
             match stored_state {
-                Some(ManagedState::ReviewPending) => Some(ManagedState::ReviewPending),
+                Some(ManagedState::Reviewing | ManagedState::ReviewPending) => stored_state,
                 Some(ManagedState::Done | ManagedState::Blocked) => stored_state,
                 _ => Some(ManagedState::PrOpen),
             }
         } else {
             match stored_state {
-                Some(ManagedState::PrOpen | ManagedState::ReviewPending) => {
-                    Some(ManagedState::Working)
-                }
+                Some(
+                    ManagedState::PrOpen | ManagedState::Reviewing | ManagedState::ReviewPending,
+                ) => Some(ManagedState::Working),
                 _ => stored_state,
             }
         };
@@ -224,6 +234,26 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             WorkflowAction::Ignore
             | WorkflowAction::WaitForStart
             | WorkflowAction::WaitForReview => Ok(()),
+            WorkflowAction::RunSelfReview => {
+                let Some(pr) = active_pr else {
+                    return Ok(());
+                };
+                self.run_existing_self_review(
+                    WorkRequest {
+                        target,
+                        item: &item,
+                        content: &content,
+                        thread: &thread,
+                        stored,
+                        post_work_state: ManagedState::PrOpen,
+                        handled_review_id: None,
+                        review_body: None,
+                        pr_number: Some(pr.number),
+                    },
+                    pr,
+                )
+                .await
+            }
             WorkflowAction::Triage => {
                 self.triage(TriageRequest {
                     target,
@@ -567,6 +597,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                             body: self.comment_composer.pr_body(work.item, work.content),
                             head: identity.branch.clone(),
                             base: work.target.base_branch.clone(),
+                            draft: true,
                         },
                     )
                     .await?
@@ -575,7 +606,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         self.store.attach_pr(store_key, pr.number)?;
         self.store.mark_state(
             store_key,
-            work.post_work_state,
+            ManagedState::Reviewing,
             work.thread.latest_human_comment_id(&self.config.bot_login),
         )?;
         if work.post_work_state == ManagedState::ReviewPending {
@@ -587,16 +618,218 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             work.content.number,
             &self.comment_composer.pr_progress_comment(
                 work.item,
-                work.post_work_state,
+                ManagedState::Reviewing,
                 &identity.branch,
                 pr.number,
             ),
         )
         .await;
-        self.try_request_reviewers(work.target, pr.number, &work.target.review.reviewers)
+        let validation = ValidationRunner::new(&identity.worktree_path, &work.target.commands.test);
+        self.run_self_review_gate(SelfReviewRequest {
+            work,
+            identity: &identity,
+            store_key,
+            pr,
+            prompt: &prompt,
+            validation: &validation,
+        })
+        .await
+    }
+
+    async fn run_existing_self_review(
+        &self,
+        work: WorkRequest<'_>,
+        pr: &crate::github::PullRequestInfo,
+    ) -> Result<()> {
+        let Some(stored) = work.stored.as_ref() else {
+            return Ok(());
+        };
+        let Some(branch) = stored.branch.as_deref() else {
+            return Ok(());
+        };
+        let Some(worktree_path) = stored.worktree_path.as_ref() else {
+            return Ok(());
+        };
+        let owner = stored.owner.clone();
+        let repo = stored.repo.clone();
+        let item_id = stored.item_id.clone();
+        let post_work_state = if stored.last_review_id.is_some() {
+            ManagedState::ReviewPending
+        } else {
+            ManagedState::PrOpen
+        };
+        let handled_review_id = stored.last_review_id;
+        let identity = WorkIdentity {
+            branch: branch.to_string(),
+            worktree_path: PathBuf::from(worktree_path),
+        };
+        self.workspace
+            .ensure_worktree(work.target, &identity)
+            .await?;
+        let discussion = self
+            .comment_composer
+            .discussion_text(work.thread.comments());
+        let prompt =
+            ImplementationPrompt::new(&work.content.title, &discussion, &work.target.commands.test);
+        let validation = ValidationRunner::new(&identity.worktree_path, &work.target.commands.test);
+        self.run_self_review_gate(SelfReviewRequest {
+            work: WorkRequest {
+                post_work_state,
+                handled_review_id,
+                ..work
+            },
+            identity: &identity,
+            store_key: StoreItemKey::new(owner.as_str(), repo.as_str(), item_id.as_str()),
+            pr: pr.clone(),
+            prompt: &prompt,
+            validation: &validation,
+        })
+        .await
+    }
+
+    async fn run_self_review_gate(&self, request: SelfReviewRequest<'_, '_>) -> Result<()> {
+        let SelfReviewRequest {
+            work,
+            identity,
+            store_key,
+            pr,
+            prompt,
+            validation,
+        } = request;
+        self.github
+            .convert_pull_request_to_draft(work.target, &pr)
+            .await?;
+        for attempt in 0..=work.target.commands.max_fix_attempts {
+            let review_prompt = prompt.render_self_review();
+            let review = self
+                .runner
+                .self_review(
+                    &work.target.commands,
+                    &identity.worktree_path,
+                    &review_prompt,
+                )
+                .await?;
+            self.try_create_issue_comment(
+                work.target,
+                pr.number,
+                &self.comment_composer.self_review_comment(&review),
+            )
             .await;
-        self.try_set_project_status(work.target, work.item, &work.target.workflow.review_status)
-            .await;
+
+            match review.outcome {
+                SelfReviewOutcome::Ready => {
+                    self.github
+                        .mark_pull_request_ready(work.target, &pr)
+                        .await?;
+                    self.store.mark_state(
+                        store_key,
+                        work.post_work_state,
+                        work.thread.latest_human_comment_id(&self.config.bot_login),
+                    )?;
+                    if work.post_work_state == ManagedState::ReviewPending {
+                        self.store
+                            .mark_review_handled(store_key, work.handled_review_id)?;
+                    }
+                    self.try_create_issue_comment(
+                        work.target,
+                        pr.number,
+                        &self.comment_composer.review_ready_comment(),
+                    )
+                    .await;
+                    self.try_create_issue_comment(
+                        work.target,
+                        work.content.number,
+                        &self.comment_composer.pr_progress_comment(
+                            work.item,
+                            work.post_work_state,
+                            &identity.branch,
+                            pr.number,
+                        ),
+                    )
+                    .await;
+                    self.try_request_reviewers(
+                        work.target,
+                        pr.number,
+                        &work.target.review.reviewers,
+                    )
+                    .await;
+                    self.try_set_project_status(
+                        work.target,
+                        work.item,
+                        &work.target.workflow.review_status,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                SelfReviewOutcome::NeedsFix if attempt < work.target.commands.max_fix_attempts => {
+                    let repair_prompt = prompt.render_self_review_repair(&review);
+                    self.runner
+                        .implement(
+                            &work.target.commands,
+                            &identity.worktree_path,
+                            &repair_prompt,
+                        )
+                        .await?;
+                    if let Err(err) = validation.run().await {
+                        let repair_prompt = prompt.render_repair(&format!("{err:#}"));
+                        self.runner
+                            .implement(
+                                &work.target.commands,
+                                &identity.worktree_path,
+                                &repair_prompt,
+                            )
+                            .await?;
+                        validation.run().await?;
+                    }
+                    let committed = self
+                        .workspace
+                        .commit_all(
+                            &identity.worktree_path,
+                            &format!("Address self-review for {}", work.content.title),
+                        )
+                        .await?;
+                    if committed
+                        || self
+                            .workspace
+                            .has_diff_against_base(
+                                &identity.worktree_path,
+                                work.target.base_branch(),
+                            )
+                            .await?
+                    {
+                        self.workspace
+                            .push(&identity.worktree_path, &identity.branch)
+                            .await?;
+                    }
+                }
+                SelfReviewOutcome::NeedsFix | SelfReviewOutcome::Blocked => {
+                    self.store.mark_state(
+                        store_key,
+                        ManagedState::Blocked,
+                        work.thread
+                            .comments()
+                            .iter()
+                            .map(|comment| comment.id)
+                            .max(),
+                    )?;
+                    self.try_create_issue_comment(
+                        work.target,
+                        work.content.number,
+                        &self
+                            .comment_composer
+                            .blocked_self_review_comment(work.item, &review),
+                    )
+                    .await;
+                    self.try_set_project_status(
+                        work.target,
+                        work.item,
+                        &work.target.workflow.blocked_status,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -755,6 +988,18 @@ impl CommentComposer {
         )
     }
 
+    pub(crate) fn blocked_self_review_comment(
+        &self,
+        item: &ProjectItem,
+        review: &SelfReviewResult,
+    ) -> String {
+        format!(
+            "{}\n\nImplementation is blocked after AI self-review.\n\n{}",
+            self.marker(item, ManagedState::Blocked),
+            self.self_review_body(review)
+        )
+    }
+
     pub(crate) fn no_changes_comment(&self, item: &ProjectItem) -> String {
         format!(
             "{}\n\nImplementation produced no repository changes, so no pull request was opened.",
@@ -791,10 +1036,22 @@ impl CommentComposer {
             .render();
         let action = match state {
             ManagedState::PrOpen => "Opened",
+            ManagedState::Reviewing => "Opened draft",
             ManagedState::ReviewPending => "Updated",
             _ => "Tracked",
         };
         format!("{marker}\n\n{action} pull request #{pr_number} for this item.")
+    }
+
+    pub(crate) fn self_review_comment(&self, review: &SelfReviewResult) -> String {
+        format!(
+            "AI self-review result:\n\n{}",
+            self.self_review_body(review)
+        )
+    }
+
+    pub(crate) fn review_ready_comment(&self) -> String {
+        "Review Ready: AI self-review passed and this PR is ready for human review.".to_string()
     }
 
     pub(crate) fn discussion_monitor_comment(
@@ -834,6 +1091,27 @@ impl CommentComposer {
                 .last()
                 .unwrap_or(0);
             format!("{}...", &input[..end])
+        }
+    }
+
+    fn self_review_body(&self, review: &SelfReviewResult) -> String {
+        let findings = self.list_or_none(&review.findings);
+        let questions = self.list_or_none(&review.questions);
+        self.truncate(&format!(
+            "Outcome: {:?}\n\nSummary: {}\n\nFindings:\n{}\n\nQuestions:\n{}",
+            review.outcome, review.summary, findings, questions
+        ))
+    }
+
+    fn list_or_none(&self, items: &[String]) -> String {
+        if items.is_empty() {
+            "- None".to_string()
+        } else {
+            items
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
 }

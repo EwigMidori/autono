@@ -18,9 +18,9 @@ use crate::github_types::{
     ProjectItemsResponse, ProjectStatusFieldResponse, PullRequestReviewDecisionValue,
     PullRequestReviewNode, PullRequestReviewStateResponse, PullRequestReviewStateValue,
     PullRequestReviewThreadsResponse, ResolveProjectResponse, ReviewThreadCommentsResponse,
-    PROJECT_ITEMS_QUERY, PROJECT_STATUS_FIELD_QUERY, PULL_REQUEST_REVIEW_STATE_QUERY,
-    RESOLVE_PROJECT_QUERY, REVIEW_THREADS_QUERY, REVIEW_THREAD_COMMENTS_QUERY,
-    UPDATE_PROJECT_FIELD_MUTATION,
+    CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION, MARK_PULL_REQUEST_READY_MUTATION, PROJECT_ITEMS_QUERY,
+    PROJECT_STATUS_FIELD_QUERY, PULL_REQUEST_REVIEW_STATE_QUERY, RESOLVE_PROJECT_QUERY,
+    REVIEW_THREADS_QUERY, REVIEW_THREAD_COMMENTS_QUERY, UPDATE_PROJECT_FIELD_MUTATION,
 };
 use crate::workflow::{CommentView, ReviewDecision};
 
@@ -70,7 +70,10 @@ pub enum ProjectContentKind {
 #[derive(Debug, Clone)]
 pub struct PullRequestInfo {
     pub number: i64,
+    pub node_id: String,
+    pub head_sha: String,
     pub merged: bool,
+    pub is_draft: bool,
     pub review_decision: ReviewDecision,
     pub latest_review_id: Option<i64>,
     pub latest_review_body: Option<String>,
@@ -83,6 +86,7 @@ pub struct NewPullRequest {
     pub body: String,
     pub head: String,
     pub base: String,
+    pub draft: bool,
 }
 
 #[non_exhaustive]
@@ -146,6 +150,16 @@ pub trait GitHub: Send + Sync {
         target: &TargetConfig,
         pr_number: i64,
         reviewers: &[String],
+    ) -> Result<()>;
+    async fn mark_pull_request_ready(
+        &self,
+        target: &TargetConfig,
+        pr: &PullRequestInfo,
+    ) -> Result<()>;
+    async fn convert_pull_request_to_draft(
+        &self,
+        target: &TargetConfig,
+        pr: &PullRequestInfo,
     ) -> Result<()>;
     async fn list_review_threads(
         &self,
@@ -223,7 +237,10 @@ impl GitHubClient {
         let review_state = self.review_state(target, pull.number).await?;
         Ok(PullRequestInfo {
             number: github_id(pull.number)?,
+            node_id: pull.node_id,
+            head_sha: pull.head.sha,
             merged: pull.merged,
+            is_draft: pull.draft.unwrap_or(false),
             review_decision: review_state.decision,
             latest_review_id: review_state.review_id,
             latest_review_body: review_state.review_body,
@@ -576,6 +593,7 @@ impl GitHub for GitHubClient {
             .pulls(&target.owner, &target.repo)
             .create(&pr.title, &pr.head, &pr.base)
             .body(pr.body.clone())
+            .draft(pr.draft)
             .send()
             .await
             .with_context(|| {
@@ -609,6 +627,52 @@ impl GitHub for GitHubClient {
                 format!(
                     "failed to request reviewers for {}/{}#{}",
                     target.owner, target.repo, pr_number
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn mark_pull_request_ready(
+        &self,
+        target: &TargetConfig,
+        pr: &PullRequestInfo,
+    ) -> Result<()> {
+        if !pr.is_draft {
+            return Ok(());
+        }
+        let _: serde_json::Value = self
+            .graphql(
+                MARK_PULL_REQUEST_READY_MUTATION,
+                json!({ "pullRequestId": pr.node_id }),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to mark pull request {}/{}#{} ready for review",
+                    target.owner, target.repo, pr.number
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn convert_pull_request_to_draft(
+        &self,
+        target: &TargetConfig,
+        pr: &PullRequestInfo,
+    ) -> Result<()> {
+        if pr.is_draft {
+            return Ok(());
+        }
+        let _: serde_json::Value = self
+            .graphql(
+                CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION,
+                json!({ "pullRequestId": pr.node_id }),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to convert pull request {}/{}#{} to draft",
+                    target.owner, target.repo, pr.number
                 )
             })?;
         Ok(())

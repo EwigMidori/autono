@@ -40,13 +40,16 @@ flowchart TD
   K --> L{Did validation pass?}
   L -- No --> M[Reply with the failure and mark Blocked]
   L -- Yes --> N[Commit and push]
-  N --> O[Create or reuse a PR]
-  O --> P[Request reviewers]
-  P --> Q{Does review request changes?}
-  Q -- Yes --> J
-  Q -- No --> R{Was the PR merged by a human?}
-  R -- No --> P
-  R -- Yes --> S[Mark the item complete]
+  N --> O[Create or reuse a draft PR]
+  O --> P[Run AI self-review]
+  P --> Q{Self-review ready?}
+  Q -- No --> J
+  Q -- Yes --> R[Mark PR ready and request reviewers]
+  R --> T{Does human review request changes?}
+  T -- Yes --> J
+  T -- No --> U{Was the PR merged by a human?}
+  U -- No --> R
+  U -- Yes --> S[Mark the item complete]
 ```
 
 ## What It Does
@@ -77,9 +80,10 @@ Autono first confirms the request, then moves through implementation phases.
 
 5. **Review**
    - After validation passes, Autono commits and pushes the changes
-   - It creates or reuses a PR
-   - It requests reviewers
-   - If review requests changes, Autono continues on the same branch and worktree, replies to active review threads, and resolves them after the fix lands
+   - It creates or reuses a draft PR
+   - It runs an AI self-review, posts the self-review result to the PR, and fixes findings before human review
+   - Once self-review passes, it posts `Review Ready`, marks the PR ready for review, and requests reviewers
+   - If human review requests changes, Autono continues on the same branch and worktree, replies to active review threads, resolves them after the fix lands, and repeats the self-review gate before asking humans again
 
 6. **Complete**
    - After a human merges the PR, Autono marks the item complete

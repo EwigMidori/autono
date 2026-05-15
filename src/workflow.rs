@@ -18,6 +18,7 @@ pub enum ManagedState {
     Triaged,
     AwaitingStart,
     Working,
+    Reviewing,
     PrOpen,
     ReviewPending,
     Done,
@@ -40,6 +41,7 @@ pub(crate) enum WorkflowAction {
     WaitForStart,
     MonitorDiscussion,
     StartWork,
+    RunSelfReview,
     WaitForReview,
     ApplyReviewFeedback,
     WaitForMerge,
@@ -94,11 +96,12 @@ impl WorkflowPolicy {
             }
             Some(ManagedState::Working) => {
                 if view.has_pr {
-                    WorkflowAction::WaitForReview
+                    WorkflowAction::RunSelfReview
                 } else {
                     WorkflowAction::StartWork
                 }
             }
+            Some(ManagedState::Reviewing) => WorkflowAction::RunSelfReview,
             Some(ManagedState::PrOpen) => match view.review_decision {
                 ReviewDecision::ChangesRequested => WorkflowAction::ApplyReviewFeedback,
                 ReviewDecision::Approved => WorkflowAction::WaitForMerge,

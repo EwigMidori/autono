@@ -427,6 +427,22 @@ mutation UpdateProjectStatus($projectId: ID!, $itemId: ID!, $fieldId: ID!, $opti
 }
 "#;
 
+pub(crate) const MARK_PULL_REQUEST_READY_MUTATION: &str = r#"
+mutation MarkPullRequestReady($pullRequestId: ID!) {
+  markPullRequestReadyForReview(input: { pullRequestId: $pullRequestId }) {
+    pullRequest { id isDraft }
+  }
+}
+"#;
+
+pub(crate) const CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION: &str = r#"
+mutation ConvertPullRequestToDraft($pullRequestId: ID!) {
+  convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
+    pullRequest { id isDraft }
+  }
+}
+"#;
+
 pub(crate) const PULL_REQUEST_REVIEW_STATE_QUERY: &str = r#"
 query PullRequestReviewState($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
