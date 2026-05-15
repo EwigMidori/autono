@@ -1,1 +1,1 @@
-pub mod codex;
+pub(crate) mod codex;

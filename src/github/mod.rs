@@ -23,7 +23,7 @@ use crate::github_types::{
     REVIEW_THREADS_QUERY, REVIEW_THREAD_COMMENTS_QUERY, UPDATE_PROJECT_FIELD_MUTATION,
 };
 use crate::workflow::{CommentView, ReviewDecision};
-pub use models::{
+pub(crate) use models::{
     NewPullRequest, ProjectContent, ProjectContentKind, ProjectItem, PullRequestInfo, ReviewThread,
     ReviewThreadComment,
 };

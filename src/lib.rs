@@ -1,3 +1,5 @@
+#![deny(unreachable_pub)]
+
 mod config;
 mod daemon;
 #[cfg(test)]
