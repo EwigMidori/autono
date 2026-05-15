@@ -46,6 +46,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run release-plz
-        uses: MarcoIeni/release-plz-action@v0
+        uses: MarcoIeni/release-plz-action@v0.5.120
         with:
           command: release-pr
