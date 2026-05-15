@@ -1,0 +1,10 @@
+[workspace]
+changelog_update = true
+publish = true
+dependencies_update = true
+semver_check = true
+release_always = false
+
+[[package]]
+name = "autono"
+changelog_path = "CHANGELOG.md"
