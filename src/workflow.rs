@@ -38,6 +38,7 @@ pub(crate) enum WorkflowAction {
     Ignore,
     Triage,
     WaitForStart,
+    MonitorDiscussion,
     StartWork,
     WaitForReview,
     ApplyReviewFeedback,
@@ -51,7 +52,7 @@ pub(crate) struct ItemView {
     pub(crate) managed_state: Option<ManagedState>,
     pub(crate) project_status: Option<String>,
     pub(crate) has_admin_mention: bool,
-    pub(crate) has_new_admin_mention: bool,
+    pub(crate) has_new_human_comment: bool,
     pub(crate) has_pr: bool,
     pub(crate) pr_merged: bool,
     pub(crate) review_decision: ReviewDecision,
@@ -85,6 +86,8 @@ impl WorkflowPolicy {
             Some(ManagedState::Detected | ManagedState::Triaged | ManagedState::AwaitingStart) => {
                 if self.project_status_matches(&view.project_status, &self.workflow.start_status) {
                     WorkflowAction::StartWork
+                } else if view.has_new_human_comment {
+                    WorkflowAction::MonitorDiscussion
                 } else {
                     WorkflowAction::WaitForStart
                 }
@@ -112,8 +115,8 @@ impl WorkflowPolicy {
             },
             Some(ManagedState::Done) => WorkflowAction::Ignore,
             Some(ManagedState::Blocked) => {
-                if view.has_new_admin_mention {
-                    WorkflowAction::Triage
+                if view.has_new_human_comment {
+                    WorkflowAction::MonitorDiscussion
                 } else {
                     WorkflowAction::WaitForStart
                 }
@@ -329,6 +332,7 @@ impl From<Vec<CommentView>> for CommentThread {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub(crate) struct AdminMention {
+    #[allow(dead_code)]
     pub(crate) comment_id: i64,
 }
 
@@ -387,7 +391,7 @@ mod tests {
             managed_state: None,
             project_status: Some("Todo".to_string()),
             has_admin_mention: false,
-            has_new_admin_mention: false,
+            has_new_human_comment: false,
             has_pr: false,
             pr_merged: false,
             review_decision: ReviewDecision::None,
@@ -403,7 +407,7 @@ mod tests {
             managed_state: Some(ManagedState::AwaitingStart),
             project_status: Some("Triaged".to_string()),
             has_admin_mention: true,
-            has_new_admin_mention: false,
+            has_new_human_comment: false,
             has_pr: false,
             pr_merged: false,
             review_decision: ReviewDecision::None,
@@ -419,12 +423,31 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_start_monitors_new_human_comment_before_start() {
+        let view = ItemView {
+            managed_state: Some(ManagedState::AwaitingStart),
+            project_status: Some("Triaged".to_string()),
+            has_admin_mention: true,
+            has_new_human_comment: true,
+            has_pr: false,
+            pr_merged: false,
+            review_decision: ReviewDecision::None,
+            has_unhandled_review: false,
+        };
+        let policy = WorkflowPolicy::new(workflow());
+        assert_eq!(
+            policy.decide_next_action(&view),
+            WorkflowAction::MonitorDiscussion
+        );
+    }
+
+    #[test]
     fn pr_review_drives_followup_state() {
         let mut view = ItemView {
             managed_state: Some(ManagedState::PrOpen),
             project_status: Some("In Review".to_string()),
             has_admin_mention: true,
-            has_new_admin_mention: false,
+            has_new_human_comment: false,
             has_pr: true,
             pr_merged: false,
             review_decision: ReviewDecision::ChangesRequested,
@@ -450,7 +473,7 @@ mod tests {
             managed_state: Some(ManagedState::ReviewPending),
             project_status: Some("In Review".to_string()),
             has_admin_mention: true,
-            has_new_admin_mention: false,
+            has_new_human_comment: false,
             has_pr: true,
             pr_merged: false,
             review_decision: ReviewDecision::ChangesRequested,
@@ -470,12 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn blocked_item_requires_new_admin_mention_to_retriage() {
+    fn blocked_item_monitors_new_human_comment() {
         let mut view = ItemView {
             managed_state: Some(ManagedState::Blocked),
             project_status: Some("Blocked".to_string()),
             has_admin_mention: true,
-            has_new_admin_mention: false,
+            has_new_human_comment: false,
             has_pr: false,
             pr_merged: false,
             review_decision: ReviewDecision::None,
@@ -487,7 +510,10 @@ mod tests {
             policy.decide_next_action(&view),
             WorkflowAction::WaitForStart
         );
-        view.has_new_admin_mention = true;
-        assert_eq!(policy.decide_next_action(&view), WorkflowAction::Triage);
+        view.has_new_human_comment = true;
+        assert_eq!(
+            policy.decide_next_action(&view),
+            WorkflowAction::MonitorDiscussion
+        );
     }
 }

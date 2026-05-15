@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use crate::config::CommandsConfig;
 use crate::error::{OptionContext, Result, ResultContext};
@@ -46,6 +47,14 @@ pub struct ImplementationResult {
 }
 
 #[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscussionReplyDecision {
+    pub should_reply: bool,
+    #[serde(default)]
+    pub reply: String,
+}
+
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub(crate) struct TriagePrompt {
     title: String,
@@ -63,6 +72,27 @@ pub(crate) struct ImplementationPrompt {
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+pub(crate) struct DiscussionPrompt {
+    title: String,
+    body: String,
+    discussion: String,
+    state: String,
+    base_branch: String,
+    start_status: String,
+    readonly_checkout: PathBuf,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub(crate) struct DiscussionPromptContext {
+    pub state: String,
+    pub base_branch: String,
+    pub start_status: String,
+    pub readonly_checkout: PathBuf,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
 pub(crate) struct ValidationRunner {
     repo_path: PathBuf,
     command: Vec<String>,
@@ -76,6 +106,12 @@ pub trait AgentRunner: Send + Sync {
         repo_path: &Path,
         prompt: &str,
     ) -> Result<TriageResult>;
+    async fn monitor_discussion(
+        &self,
+        commands: &CommandsConfig,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> Result<DiscussionReplyDecision>;
     async fn implement(
         &self,
         commands: &CommandsConfig,
@@ -97,6 +133,19 @@ impl AgentRunner for CodexRunner {
             .json_object(&output.stdout)
             .context("codex triage output did not contain a JSON object")?;
         serde_json::from_str(json_slice).context("failed to parse codex triage JSON")
+    }
+
+    async fn monitor_discussion(
+        &self,
+        commands: &CommandsConfig,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> Result<DiscussionReplyDecision> {
+        let output = self.run(commands, repo_path, prompt).await?;
+        let json_slice = self
+            .json_object(&output.stdout)
+            .context("codex discussion output did not contain a JSON object")?;
+        serde_json::from_str(json_slice).context("failed to parse codex discussion JSON")
     }
 
     async fn implement(
@@ -259,6 +308,65 @@ Expected validation commands:
     }
 }
 
+impl DiscussionPrompt {
+    pub(crate) fn new(
+        title: &str,
+        body: &str,
+        discussion: &str,
+        context: DiscussionPromptContext,
+    ) -> Self {
+        Self {
+            title: title.to_string(),
+            body: body.to_string(),
+            discussion: discussion.to_string(),
+            state: context.state,
+            base_branch: context.base_branch,
+            start_status: context.start_status,
+            readonly_checkout: context.readonly_checkout,
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let title = truncate_end(&self.title, PROMPT_SECTION_LIMIT);
+        let body = truncate_end(&self.body, PROMPT_SECTION_LIMIT);
+        let discussion = truncate_end(&self.discussion, PROMPT_SECTION_LIMIT);
+        format!(
+            r#"You are monitoring a GitHub issue discussion for an autonomous coding daemon.
+
+Return a single JSON object with this shape:
+{{"should_reply":true,"reply":"..."}}
+
+Rules:
+- Decide whether the thread needs a user-facing reply right now.
+- If no reply is needed, set should_reply to false and reply to an empty string.
+- If a reply is needed, keep it short, concrete, and directly tied to the latest discussion.
+- Do not edit files.
+- Treat this checkout as read-only reference only:
+  {}
+- The base branch for reference is `{}`.
+- The daemon is currently in state `{}`.
+- The task should not start implementation until the Project status becomes `{}`.
+
+Title:
+{}
+
+Body:
+{}
+
+Discussion:
+{}
+"#,
+            self.readonly_checkout.display(),
+            self.base_branch,
+            self.state,
+            self.start_status,
+            title,
+            body,
+            discussion
+        )
+    }
+}
+
 fn truncate_end(input: &str, limit: usize) -> String {
     if input.len() <= limit {
         return input.to_string();
@@ -388,5 +496,28 @@ mod tests {
                 "--json".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn discussion_prompt_includes_read_only_checkout_and_gate() {
+        let prompt = DiscussionPrompt::new(
+            "summary",
+            "body",
+            "discussion",
+            DiscussionPromptContext {
+                state: "AwaitingStart".to_string(),
+                base_branch: "main".to_string(),
+                start_status: "In Progress".to_string(),
+                readonly_checkout: Path::new("/tmp/main-checkout").to_path_buf(),
+            },
+        );
+
+        let rendered = prompt.render();
+
+        assert!(rendered.contains("/tmp/main-checkout"));
+        assert!(rendered.contains("base branch for reference is `main`"));
+        assert!(rendered.contains("state `AwaitingStart`"));
+        assert!(rendered.contains("In Progress"));
+        assert!(rendered.contains("Return a single JSON object"));
     }
 }

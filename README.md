@@ -62,7 +62,7 @@ Autono first confirms the request, then moves through implementation phases.
    - Asks `codex` whether the request is a code change
    - If the request is discussion, documentation, or another non-implementation task, Autono replies and marks the item `Blocked`
    - If the request is unclear, Autono replies with questions and marks the item `Blocked`
-   - If the request is clear, Autono stores `AwaitingStart`
+   - If the request is clear, Autono stores `AwaitingStart` and keeps watching new comments for follow-up replies before implementation starts
 
 3. **Wait for the start gate**
    - Autono waits until the Project `status` field matches `workflow.start_status`
@@ -71,6 +71,7 @@ Autono first confirms the request, then moves through implementation phases.
 4. **Implement**
    - Creates a branch and a worktree
    - Runs `codex`
+   - Gives `codex` a read-only reference to the base checkout for context
    - Runs the configured validation commands
    - If validation fails, the failure output is fed back to `codex` for another fix attempt
 

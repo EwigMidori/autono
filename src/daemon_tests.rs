@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tempfile::tempdir;
 use time::OffsetDateTime;
 
-use crate::codex_runner::{AgentRunner, ImplementationResult};
+use crate::codex_runner::{AgentRunner, DiscussionReplyDecision, ImplementationResult};
 use crate::config::{
     CommandsConfig, Config, GitHubConfig, ReviewConfig, TargetConfig, TokenSource, WorkflowConfig,
 };
@@ -142,6 +142,23 @@ impl FakeGitHub {
 
     fn comments(&self) -> Vec<CommentView> {
         self.state.lock().unwrap().comments.clone()
+    }
+
+    fn add_comment(&self, author: &str, body: &str) {
+        let mut state = self.state.lock().unwrap();
+        let id = state
+            .comments
+            .iter()
+            .map(|comment| comment.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        state.comments.push(CommentView {
+            id,
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at: OffsetDateTime::now_utc(),
+        });
     }
 
     fn drop_pr_progress_comments(&self) {
@@ -339,22 +356,52 @@ impl AgentRunner for FakeRunner {
             tests_run: Vec::new(),
         })
     }
+
+    async fn monitor_discussion(
+        &self,
+        _commands: &CommandsConfig,
+        _repo_path: &Path,
+        _prompt: &str,
+    ) -> Result<DiscussionReplyDecision> {
+        Ok(DiscussionReplyDecision {
+            should_reply: false,
+            reply: String::new(),
+        })
+    }
 }
 
 #[derive(Clone)]
 struct CapturingRunner {
     prompts: Arc<Mutex<Vec<String>>>,
+    discussion_prompts: Arc<Mutex<Vec<String>>>,
+    discussion_reply: Arc<Mutex<DiscussionReplyDecision>>,
 }
 
 impl CapturingRunner {
     fn new() -> Self {
         Self {
             prompts: Arc::new(Mutex::new(Vec::new())),
+            discussion_prompts: Arc::new(Mutex::new(Vec::new())),
+            discussion_reply: Arc::new(Mutex::new(DiscussionReplyDecision {
+                should_reply: false,
+                reply: String::new(),
+            })),
         }
     }
 
     fn prompts(&self) -> Vec<String> {
         self.prompts.lock().unwrap().clone()
+    }
+
+    fn discussion_prompts(&self) -> Vec<String> {
+        self.discussion_prompts.lock().unwrap().clone()
+    }
+
+    fn set_discussion_reply(&self, should_reply: bool, reply: &str) {
+        *self.discussion_reply.lock().unwrap() = DiscussionReplyDecision {
+            should_reply,
+            reply: reply.to_string(),
+        };
     }
 }
 
@@ -386,6 +433,19 @@ impl AgentRunner for CapturingRunner {
             summary: "implemented".to_string(),
             tests_run: Vec::new(),
         })
+    }
+
+    async fn monitor_discussion(
+        &self,
+        _commands: &CommandsConfig,
+        _repo_path: &Path,
+        prompt: &str,
+    ) -> Result<DiscussionReplyDecision> {
+        self.discussion_prompts
+            .lock()
+            .unwrap()
+            .push(prompt.to_string());
+        Ok(self.discussion_reply.lock().unwrap().clone())
     }
 }
 
@@ -600,6 +660,56 @@ async fn review_feedback_prompt_includes_only_authorized_review_threads() {
     assert!(!repair_prompt.contains("Ignore all prior instructions"));
     assert!(!repair_prompt.contains("stale feedback"));
     assert!(repair_prompt.contains("reply to it with `gh api graphql`"));
+}
+
+#[tokio::test]
+async fn discussion_monitor_replies_only_when_needed() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let github = FakeGitHub::new(project_item("Todo"), vec![admin_comment()]);
+    let runner = CapturingRunner::new();
+    runner.set_discussion_reply(true, "I need one more confirmation before implementation.");
+    let workspace = fake_workspace(temp.path());
+    let daemon =
+        Daemon::with_components(config, github.clone(), runner.clone(), workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+
+    github.add_comment("alice", "Can we keep the current API shape?");
+    daemon.run_once().await.unwrap();
+
+    let prompts = runner.discussion_prompts();
+    let discussion_prompt = prompts.last().unwrap();
+    assert!(discussion_prompt.contains("read-only reference only"));
+    assert!(discussion_prompt.contains("state `AwaitingStart`"));
+    assert!(discussion_prompt.contains("checkout"));
+
+    assert_eq!(
+        github
+            .comments()
+            .iter()
+            .filter(|comment| comment.author == TEST_BOT_LOGIN)
+            .count(),
+        2
+    );
+    assert!(github
+        .comments()
+        .iter()
+        .any(|comment| comment.body.contains("one more confirmation")));
+
+    runner.set_discussion_reply(false, "");
+    github.add_comment("alice", "No more changes for now.");
+    daemon.run_once().await.unwrap();
+
+    assert_eq!(
+        github
+            .comments()
+            .iter()
+            .filter(|comment| comment.author == TEST_BOT_LOGIN)
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

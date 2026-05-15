@@ -5,7 +5,8 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::codex_runner::{
-    AgentRunner, CodexRunner, ImplementationPrompt, TriagePrompt, ValidationRunner,
+    AgentRunner, CodexRunner, DiscussionPrompt, DiscussionPromptContext, ImplementationPrompt,
+    TriagePrompt, ValidationRunner,
 };
 use crate::config::{Config, TargetConfig};
 use crate::error::{Result, ResultContext};
@@ -48,6 +49,16 @@ struct TriageRequest<'a> {
     item: &'a ProjectItem,
     content: &'a ProjectContent,
     thread: &'a CommentThread,
+    latest_comment_id: Option<i64>,
+}
+
+#[derive(Debug)]
+struct DiscussionRequest<'a> {
+    target: &'a TargetConfig,
+    item: &'a ProjectItem,
+    content: &'a ProjectContent,
+    thread: &'a CommentThread,
+    state: ManagedState,
     latest_comment_id: Option<i64>,
 }
 impl<G: GitHub> Daemon<G, CodexRunner, GitWorkspace> {
@@ -149,15 +160,14 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
         let mention = self.admin_mention(target, &thread).await?;
         let has_admin_mention = mention.is_some();
         let last_seen_comment_id = stored.as_ref().and_then(|item| item.last_comment_id);
-        let has_new_admin_mention = mention
-            .as_ref()
-            .map(|mention| {
+        let latest_human_comment_id = thread.latest_human_comment_id(&self.config.bot_login);
+        let has_new_human_comment = latest_human_comment_id
+            .map(|latest| {
                 last_seen_comment_id
-                    .map(|last_seen| mention.comment_id > last_seen)
+                    .map(|last_seen| latest > last_seen)
                     .unwrap_or(true)
             })
             .unwrap_or(false);
-        let latest_human_comment_id = thread.latest_human_comment_id(&self.config.bot_login);
 
         let candidate_branch = stored
             .as_ref()
@@ -199,7 +209,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             managed_state,
             project_status: item.status.clone(),
             has_admin_mention,
-            has_new_admin_mention,
+            has_new_human_comment,
             has_pr: active_pr.is_some(),
             pr_merged: pr.as_ref().map(|pr| pr.merged).unwrap_or(false),
             review_decision: active_pr
@@ -220,6 +230,17 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                     item: &item,
                     content: &content,
                     thread: &thread,
+                    latest_comment_id: latest_human_comment_id,
+                })
+                .await
+            }
+            WorkflowAction::MonitorDiscussion => {
+                self.monitor_discussion(DiscussionRequest {
+                    target,
+                    item: &item,
+                    content: &content,
+                    thread: &thread,
+                    state: managed_state.unwrap_or(ManagedState::Blocked),
                     latest_comment_id: latest_human_comment_id,
                 })
                 .await
@@ -344,6 +365,52 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                 .await;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn monitor_discussion(&self, request: DiscussionRequest<'_>) -> Result<()> {
+        let discussion = self
+            .comment_composer
+            .discussion_text(request.thread.comments());
+        let prompt = DiscussionPrompt::new(
+            &request.content.title,
+            &request.content.body,
+            &discussion,
+            DiscussionPromptContext {
+                state: request.state.to_string(),
+                base_branch: request.target.base_branch.clone(),
+                start_status: request.target.workflow.start_status.clone(),
+                readonly_checkout: request.target.checkout_path.clone(),
+            },
+        )
+        .render();
+        let decision = self
+            .runner
+            .monitor_discussion(
+                &request.target.commands,
+                &request.target.checkout_path,
+                &prompt,
+            )
+            .await?;
+        let store_key = StoreItemKey::new(
+            &request.target.owner,
+            &request.target.repo,
+            &request.item.id,
+        );
+        self.store
+            .mark_state(store_key, request.state, request.latest_comment_id)?;
+        if decision.should_reply && !decision.reply.trim().is_empty() {
+            self.try_create_issue_comment(
+                request.target,
+                request.content.number,
+                &self.comment_composer.discussion_monitor_comment(
+                    request.item,
+                    request.state,
+                    &decision.reply,
+                ),
+            )
+            .await;
         }
         Ok(())
     }
@@ -728,6 +795,15 @@ impl CommentComposer {
             _ => "Tracked",
         };
         format!("{marker}\n\n{action} pull request #{pr_number} for this item.")
+    }
+
+    pub(crate) fn discussion_monitor_comment(
+        &self,
+        item: &ProjectItem,
+        state: ManagedState,
+        reply: &str,
+    ) -> String {
+        format!("{}\n\n{}", self.marker(item, state), self.truncate(reply))
     }
 
     fn marker(&self, item: &ProjectItem, state: ManagedState) -> String {
