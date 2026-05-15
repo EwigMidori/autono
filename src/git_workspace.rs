@@ -66,6 +66,25 @@ impl GitWorkspace {
         Ok(!output.stdout.trim().is_empty())
     }
 
+    async fn branch_has_diff_against_base(
+        &self,
+        worktree: &Path,
+        base_branch: &str,
+    ) -> Result<bool> {
+        let range = format!("origin/{base_branch}...HEAD");
+        let output = self
+            .git(worktree, &["diff", "--quiet", &range, "--"])
+            .await?;
+        match output.status_code {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => {
+                output.ensure_success("git diff")?;
+                Ok(false)
+            }
+        }
+    }
+
     async fn branch_exists(&self, working_dir: &Path, branch: &str) -> Result<bool> {
         let output = self
             .git(working_dir, &["rev-parse", "--verify", branch])
@@ -118,6 +137,7 @@ pub trait WorkspaceManager: Send + Sync {
     fn identity(&self, target: &TargetConfig, item_id: &str, title: &str) -> WorkIdentity;
     async fn ensure_worktree(&self, target: &TargetConfig, identity: &WorkIdentity) -> Result<()>;
     async fn commit_all(&self, worktree: &Path, message: &str) -> Result<bool>;
+    async fn has_diff_against_base(&self, worktree: &Path, base_branch: &str) -> Result<bool>;
     async fn push(&self, worktree: &Path, branch: &str) -> Result<()>;
 }
 
@@ -180,6 +200,11 @@ impl WorkspaceManager for GitWorkspace {
             .await?
             .ensure_success("git commit")?;
         Ok(true)
+    }
+
+    async fn has_diff_against_base(&self, worktree: &Path, base_branch: &str) -> Result<bool> {
+        self.branch_has_diff_against_base(worktree, base_branch)
+            .await
     }
 
     async fn push(&self, worktree: &Path, branch: &str) -> Result<()> {

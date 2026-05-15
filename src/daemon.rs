@@ -141,6 +141,8 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                         .build()
                         .expect("stored item builder was missing required fields after explicit initialization");
                     stored.last_comment_id = Some(marker.comment_id);
+                    stored.branch = marker.branch;
+                    stored.pr_number = marker.pr_number;
                     stored
                 })
             });
@@ -157,28 +159,50 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             .unwrap_or(false);
         let latest_human_comment_id = thread.latest_human_comment_id(&self.config.bot_login);
 
-        let pr = match stored.as_ref().and_then(|stored| stored.branch.clone()) {
-            Some(branch) => self.github.find_agent_pr(target, &branch).await?,
+        let candidate_branch = stored
+            .as_ref()
+            .and_then(|stored| stored.branch.clone())
+            .or_else(|| {
+                stored.as_ref().map(|_| {
+                    self.workspace
+                        .identity(target, &item.id, &item.title)
+                        .branch
+                })
+            });
+        let pr = match candidate_branch.as_deref() {
+            Some(branch) => self.github.find_agent_pr(target, branch).await?,
             None => None,
         };
-        let latest_review_id = pr.as_ref().and_then(|pr| pr.latest_review_id);
-        let latest_review_body = pr.as_ref().and_then(|pr| pr.latest_review_body.clone());
-        let pr_number = pr
-            .as_ref()
-            .map(|pr| pr.number)
-            .or_else(|| stored.as_ref().and_then(|item| item.pr_number));
+        let active_pr = pr.as_ref().filter(|pr| !pr.merged);
+        let latest_review_id = active_pr.and_then(|pr| pr.latest_review_id);
+        let latest_review_body = active_pr.and_then(|pr| pr.latest_review_body.clone());
+        let pr_number = active_pr.map(|pr| pr.number);
         let has_unhandled_review = latest_review_id.is_some()
             && latest_review_id != stored.as_ref().and_then(|item| item.last_review_id);
+        let stored_state = stored.as_ref().map(|stored| stored.state);
+        let managed_state = if active_pr.is_some() {
+            match stored_state {
+                Some(ManagedState::ReviewPending) => Some(ManagedState::ReviewPending),
+                Some(ManagedState::Done | ManagedState::Blocked) => stored_state,
+                _ => Some(ManagedState::PrOpen),
+            }
+        } else {
+            match stored_state {
+                Some(ManagedState::PrOpen | ManagedState::ReviewPending) => {
+                    Some(ManagedState::Working)
+                }
+                _ => stored_state,
+            }
+        };
 
         let view = ItemView {
-            managed_state: stored.as_ref().map(|stored| stored.state),
+            managed_state,
             project_status: item.status.clone(),
             has_admin_mention,
             has_new_admin_mention,
-            has_pr: pr.is_some() || stored.as_ref().and_then(|item| item.pr_number).is_some(),
+            has_pr: active_pr.is_some(),
             pr_merged: pr.as_ref().map(|pr| pr.merged).unwrap_or(false),
-            review_decision: pr
-                .as_ref()
+            review_decision: active_pr
                 .map(|pr| pr.review_decision)
                 .unwrap_or(ReviewDecision::None),
             has_unhandled_review,
@@ -426,7 +450,12 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
                 &format!("Implement {}", work.content.title),
             )
             .await?;
-        if committed {
+        let branch_has_changes = committed
+            || self
+                .workspace
+                .has_diff_against_base(&identity.worktree_path, work.target.base_branch())
+                .await?;
+        if branch_has_changes {
             self.workspace
                 .push(&identity.worktree_path, &identity.branch)
                 .await?;
@@ -438,7 +467,7 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             .await?
         {
             Some(pr) => pr,
-            None if !committed => {
+            None if !branch_has_changes => {
                 self.store.mark_state(
                     store_key,
                     ManagedState::Blocked,
@@ -486,6 +515,17 @@ impl<G: GitHub, R: AgentRunner, W: WorkspaceManager> Daemon<G, R, W> {
             self.store
                 .mark_review_handled(store_key, work.handled_review_id)?;
         }
+        self.try_create_issue_comment(
+            work.target,
+            work.content.number,
+            &self.comment_composer.pr_progress_comment(
+                work.item,
+                work.post_work_state,
+                &identity.branch,
+                pr.number,
+            ),
+        )
+        .await;
         self.try_request_reviewers(work.target, pr.number, &work.target.review.reviewers)
             .await;
         self.try_set_project_status(work.target, work.item, &work.target.workflow.review_status)
@@ -669,6 +709,25 @@ impl CommentComposer {
             "{}\n\nThe linked pull request has been merged. Marking this task complete.",
             self.marker(item, ManagedState::Done)
         )
+    }
+
+    pub(crate) fn pr_progress_comment(
+        &self,
+        item: &ProjectItem,
+        state: ManagedState,
+        branch: &str,
+        pr_number: i64,
+    ) -> String {
+        let marker = AutonoMarker::new(&item.id, state)
+            .with_branch(branch)
+            .with_pr_number(pr_number)
+            .render();
+        let action = match state {
+            ManagedState::PrOpen => "Opened",
+            ManagedState::ReviewPending => "Updated",
+            _ => "Tracked",
+        };
+        format!("{marker}\n\n{action} pull request #{pr_number} for this item.")
     }
 
     fn marker(&self, item: &ProjectItem, state: ManagedState) -> String {

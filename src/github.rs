@@ -15,9 +15,12 @@ use tokio::time as tokio_time;
 use crate::config::{GitHubConfig, TargetConfig, TokenSource};
 use crate::error::{Error, OptionContext, Result, ResultContext};
 use crate::github_types::{
-    ProjectFieldsResponse, ProjectItemsResponse, PullRequestReviewThreadsResponse,
-    ResolveProjectResponse, PROJECT_FIELDS_QUERY, PROJECT_ITEMS_QUERY, RESOLVE_PROJECT_QUERY,
-    REVIEW_THREADS_QUERY, UPDATE_PROJECT_FIELD_MUTATION,
+    ProjectItemsResponse, ProjectStatusFieldResponse, PullRequestReviewDecisionValue,
+    PullRequestReviewNode, PullRequestReviewStateResponse, PullRequestReviewStateValue,
+    PullRequestReviewThreadsResponse, ResolveProjectResponse, ReviewThreadCommentsResponse,
+    PROJECT_ITEMS_QUERY, PROJECT_STATUS_FIELD_QUERY, PULL_REQUEST_REVIEW_STATE_QUERY,
+    RESOLVE_PROJECT_QUERY, REVIEW_THREADS_QUERY, REVIEW_THREAD_COMMENTS_QUERY,
+    UPDATE_PROJECT_FIELD_MUTATION,
 };
 use crate::workflow::{CommentView, ReviewDecision};
 
@@ -228,40 +231,60 @@ impl GitHubClient {
     }
 
     async fn review_state(&self, target: &TargetConfig, pr_number: u64) -> Result<ReviewState> {
-        let page = self
-            .octo
-            .pulls(&target.owner, &target.repo)
-            .list_reviews(pr_number)
-            .per_page(100)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to list pull request reviews for {}/{}#{}",
-                    target.owner, target.repo, pr_number
-                )
-            })?;
-        let reviews = self.collect_pages(page, "pull request reviews").await?;
-        for review in reviews.iter().rev() {
-            match review.state {
-                Some(pulls::ReviewState::ChangesRequested) => {
-                    return Ok(ReviewState::new(
-                        ReviewDecision::ChangesRequested,
-                        Some(github_id(review.id.into_inner())?),
-                        review.body.clone().filter(|body| !body.trim().is_empty()),
-                    ));
-                }
-                Some(pulls::ReviewState::Approved) => {
-                    return Ok(ReviewState::new(
-                        ReviewDecision::Approved,
-                        Some(github_id(review.id.into_inner())?),
-                        review.body.clone().filter(|body| !body.trim().is_empty()),
-                    ));
-                }
-                _ => {}
+        let mut reviews = Vec::new();
+        let mut after: Option<String> = None;
+        let mut page_count = 0usize;
+        let mut decision = None;
+        loop {
+            page_count += 1;
+            if page_count > MAX_GRAPHQL_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub GraphQL pagination exceeded {MAX_GRAPHQL_PAGES} pages for pull request review state"
+                )));
             }
+            let data: PullRequestReviewStateResponse = self
+                .graphql(
+                    PULL_REQUEST_REVIEW_STATE_QUERY,
+                    json!({
+                        "owner": target.owner,
+                        "repo": target.repo,
+                        "number": pr_number,
+                        "after": after,
+                    }),
+                )
+                .await?;
+            let pull_request = data
+                .repository
+                .and_then(|repository| repository.pull_request)
+                .context(format!(
+                    "pull request {}/{}#{} not found",
+                    target.owner, target.repo, pr_number
+                ))?;
+            let page_decision = review_decision_from_github(pull_request.review_decision);
+            if decision.is_none() {
+                decision = Some(page_decision);
+            }
+            let Some(page) = pull_request.latest_opinionated_reviews else {
+                break;
+            };
+            let has_next_page = page.page_info.has_next_page;
+            let next_after = page.page_info.end_cursor.clone();
+            reviews.extend(page.nodes);
+            if !has_next_page {
+                break;
+            }
+            let next_after = next_after.context("pull request review page had no end cursor")?;
+            if after.as_deref() == Some(next_after.as_str()) {
+                return Err(Error::message(
+                    "GitHub pull request review pagination cursor did not advance",
+                ));
+            }
+            after = Some(next_after);
         }
-        Ok(ReviewState::new(ReviewDecision::None, None, None))
+        Ok(review_state_for_decision(
+            decision.unwrap_or(ReviewDecision::None),
+            reviews,
+        ))
     }
 }
 
@@ -280,6 +303,54 @@ impl ReviewState {
             review_id,
             review_body,
         }
+    }
+}
+
+fn review_decision_from_github(decision: Option<PullRequestReviewDecisionValue>) -> ReviewDecision {
+    match decision {
+        Some(PullRequestReviewDecisionValue::Approved) => ReviewDecision::Approved,
+        Some(PullRequestReviewDecisionValue::ChangesRequested) => ReviewDecision::ChangesRequested,
+        Some(PullRequestReviewDecisionValue::ReviewRequired) | None => ReviewDecision::None,
+    }
+}
+
+fn review_state_for_decision(
+    decision: ReviewDecision,
+    reviews: Vec<PullRequestReviewNode>,
+) -> ReviewState {
+    let Some(wanted_state) = opinionated_review_state(decision) else {
+        return ReviewState::new(decision, None, None);
+    };
+    let latest_review = reviews
+        .into_iter()
+        .filter(|review| review.state == wanted_state)
+        .max_by(|left, right| {
+            left.submitted_at
+                .cmp(&right.submitted_at)
+                .then_with(|| left.full_database_id.cmp(&right.full_database_id))
+        });
+    ReviewState::new(
+        decision,
+        latest_review
+            .as_ref()
+            .and_then(|review| review.full_database_id),
+        latest_review.and_then(|review| non_empty_review_body(review.body)),
+    )
+}
+
+fn opinionated_review_state(decision: ReviewDecision) -> Option<PullRequestReviewStateValue> {
+    match decision {
+        ReviewDecision::Approved => Some(PullRequestReviewStateValue::Approved),
+        ReviewDecision::ChangesRequested => Some(PullRequestReviewStateValue::ChangesRequested),
+        ReviewDecision::None => None,
+    }
+}
+
+fn non_empty_review_body(body: String) -> Option<String> {
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(body)
     }
 }
 
@@ -304,7 +375,11 @@ impl GitHub for GitHubClient {
             let data: ProjectItemsResponse = self
                 .graphql(
                     PROJECT_ITEMS_QUERY,
-                    json!({ "projectId": project_id, "after": after }),
+                    json!({
+                        "projectId": project_id,
+                        "statusField": target.workflow.status_field,
+                        "after": after,
+                    }),
                 )
                 .await?;
             let page = data.node.items;
@@ -313,7 +388,7 @@ impl GitHub for GitHubClient {
             items.extend(
                 page.nodes
                     .into_iter()
-                    .filter_map(|node| node.into_project_item(&target.workflow.status_field)),
+                    .filter_map(|node| node.into_project_item()),
             );
             if !has_next_page {
                 break;
@@ -426,17 +501,21 @@ impl GitHub for GitHubClient {
         } else {
             self.resolve_project_id(target).await?
         };
-        let data: ProjectFieldsResponse = self
-            .graphql(PROJECT_FIELDS_QUERY, json!({ "projectId": project_id }))
+        let data: ProjectStatusFieldResponse = self
+            .graphql(
+                PROJECT_STATUS_FIELD_QUERY,
+                json!({
+                    "projectId": project_id,
+                    "statusField": target.workflow.status_field,
+                }),
+            )
             .await?;
-        let field = data
-            .node
-            .fields
-            .nodes
-            .into_iter()
-            .flatten()
-            .find(|field| field.name == target.workflow.status_field)
-            .with_context(|| format!("status field {} not found", target.workflow.status_field))?;
+        let field = data.node.status_field.with_context(|| {
+            format!(
+                "status field {} not found or is not a single-select field",
+                target.workflow.status_field
+            )
+        })?;
         let option = field
             .options
             .into_iter()
@@ -462,7 +541,7 @@ impl GitHub for GitHubClient {
         branch: &str,
     ) -> Result<Option<PullRequestInfo>> {
         let head = format!("{}:{branch}", target.owner);
-        let mut page = self
+        let page = self
             .octo
             .pulls(&target.owner, &target.repo)
             .list()
@@ -477,7 +556,11 @@ impl GitHub for GitHubClient {
                     target.owner, target.repo
                 )
             })?;
-        match page.take_items().into_iter().next() {
+        let pulls = self.collect_pages(page, "pull requests").await?;
+        match pulls
+            .into_iter()
+            .find(|pull| pull.merged || pull.state == octocrab::models::IssueState::Open)
+        {
             Some(pull) => Ok(Some(self.pull_info(target, pull).await?)),
             None => Ok(None),
         }
@@ -567,7 +650,20 @@ impl GitHub for GitHubClient {
             let page = pull_request.review_threads;
             let has_next_page = page.page_info.has_next_page;
             let next_after = page.page_info.end_cursor.clone();
-            threads.extend(page.nodes.into_iter().map(|node| node.into_review_thread()));
+            for node in page.nodes {
+                let (mut thread, comment_page) = node.into_review_thread_parts();
+                if comment_page.has_next_page {
+                    let next_comment_after = comment_page
+                        .end_cursor
+                        .context("review thread comment page had no end cursor")?;
+                    let thread_id = thread.id.clone();
+                    thread.comments.extend(
+                        self.list_review_thread_comments(&thread_id, next_comment_after)
+                            .await?,
+                    );
+                }
+                threads.push(thread);
+            }
             if !has_next_page {
                 break;
             }
@@ -584,6 +680,49 @@ impl GitHub for GitHubClient {
 }
 
 impl GitHubClient {
+    async fn list_review_thread_comments(
+        &self,
+        thread_id: &str,
+        initial_after: String,
+    ) -> Result<Vec<ReviewThreadComment>> {
+        let mut comments = Vec::new();
+        let mut after = initial_after;
+        let mut page_count = 0usize;
+        loop {
+            page_count += 1;
+            if page_count > MAX_GRAPHQL_PAGES {
+                return Err(Error::message(format!(
+                    "GitHub GraphQL pagination exceeded {MAX_GRAPHQL_PAGES} pages for review thread comments"
+                )));
+            }
+            let data: ReviewThreadCommentsResponse = self
+                .graphql(
+                    REVIEW_THREAD_COMMENTS_QUERY,
+                    json!({ "threadId": thread_id, "after": after }),
+                )
+                .await?;
+            let page = data
+                .node
+                .context(format!("review thread {thread_id} not found"))?
+                .comments;
+            let (page_comments, page_info) = page.into_parts();
+            comments.extend(page_comments);
+            if !page_info.has_next_page {
+                break;
+            }
+            let next_after = page_info
+                .end_cursor
+                .context("review thread comments page had no end cursor")?;
+            if next_after == after {
+                return Err(Error::message(
+                    "GitHub review thread comments pagination cursor did not advance",
+                ));
+            }
+            after = next_after;
+        }
+        Ok(comments)
+    }
+
     async fn resolve_project_id(&self, target: &TargetConfig) -> Result<String> {
         let number = target
             .project_number
@@ -668,4 +807,69 @@ fn github_time(seconds: i64, nanos: u32) -> Result<OffsetDateTime> {
 
 fn is_not_found(err: &octocrab::Error) -> bool {
     matches!(err, octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 404)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(
+        id: i64,
+        state: PullRequestReviewStateValue,
+        body: &str,
+        submitted_at: i64,
+    ) -> PullRequestReviewNode {
+        PullRequestReviewNode {
+            full_database_id: Some(id),
+            body: body.to_string(),
+            state,
+            submitted_at: Some(OffsetDateTime::from_unix_timestamp(submitted_at).unwrap()),
+        }
+    }
+
+    #[test]
+    fn review_state_prefers_latest_matching_changes_request() {
+        let state = review_state_for_decision(
+            ReviewDecision::ChangesRequested,
+            vec![
+                review(
+                    101,
+                    PullRequestReviewStateValue::ChangesRequested,
+                    "Please fix the race.",
+                    10,
+                ),
+                review(
+                    102,
+                    PullRequestReviewStateValue::Approved,
+                    "Looks good.",
+                    20,
+                ),
+            ],
+        );
+
+        assert_eq!(state.decision, ReviewDecision::ChangesRequested);
+        assert_eq!(state.review_id, Some(101));
+        assert_eq!(state.review_body.as_deref(), Some("Please fix the race."));
+    }
+
+    #[test]
+    fn review_state_uses_latest_matching_review_and_drops_blank_body() {
+        let state = review_state_for_decision(
+            ReviewDecision::Approved,
+            vec![
+                review(201, PullRequestReviewStateValue::Approved, "Ship it.", 10),
+                review(202, PullRequestReviewStateValue::Approved, "   ", 20),
+                review(
+                    203,
+                    PullRequestReviewStateValue::ChangesRequested,
+                    "Needs work.",
+                    30,
+                ),
+            ],
+        );
+
+        assert_eq!(state.decision, ReviewDecision::Approved);
+        assert_eq!(state.review_id, Some(202));
+        assert_eq!(state.review_body, None);
+    }
 }

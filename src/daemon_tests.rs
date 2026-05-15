@@ -132,12 +132,24 @@ impl FakeGitHub {
         }
     }
 
+    fn close_pr_without_merge(&self) {
+        self.state.lock().unwrap().pr = None;
+    }
+
     fn add_review_thread(&self, thread: ReviewThread) {
         self.state.lock().unwrap().review_threads.push(thread);
     }
 
     fn comments(&self) -> Vec<CommentView> {
         self.state.lock().unwrap().comments.clone()
+    }
+
+    fn drop_pr_progress_comments(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .comments
+            .retain(|comment| !comment.body.contains("pull request #"));
     }
 
     fn statuses(&self) -> Vec<String> {
@@ -382,6 +394,19 @@ struct FakeWorkspace {
     root: PathBuf,
     committed: Arc<Mutex<usize>>,
     pushed: Arc<Mutex<usize>>,
+    commit_results: Arc<Mutex<Vec<bool>>>,
+    push_failures_remaining: Arc<Mutex<usize>>,
+    branch_has_diff: Arc<Mutex<bool>>,
+}
+
+impl FakeWorkspace {
+    fn set_commit_results(&self, results: Vec<bool>) {
+        *self.commit_results.lock().unwrap() = results;
+    }
+
+    fn fail_next_push(&self) {
+        *self.push_failures_remaining.lock().unwrap() += 1;
+    }
 }
 
 #[async_trait]
@@ -400,11 +425,31 @@ impl WorkspaceManager for FakeWorkspace {
 
     async fn commit_all(&self, _worktree: &Path, _message: &str) -> Result<bool> {
         *self.committed.lock().unwrap() += 1;
-        Ok(true)
+        let committed = {
+            let mut results = self.commit_results.lock().unwrap();
+            if results.is_empty() {
+                true
+            } else {
+                results.remove(0)
+            }
+        };
+        if committed {
+            *self.branch_has_diff.lock().unwrap() = true;
+        }
+        Ok(committed)
+    }
+
+    async fn has_diff_against_base(&self, _worktree: &Path, _base_branch: &str) -> Result<bool> {
+        Ok(*self.branch_has_diff.lock().unwrap())
     }
 
     async fn push(&self, _worktree: &Path, _branch: &str) -> Result<()> {
         *self.pushed.lock().unwrap() += 1;
+        let mut failures_remaining = self.push_failures_remaining.lock().unwrap();
+        if *failures_remaining > 0 {
+            *failures_remaining -= 1;
+            return Err(Error::message("push failed"));
+        }
         Ok(())
     }
 }
@@ -441,6 +486,9 @@ fn fake_workspace(root: &Path) -> FakeWorkspace {
         root: root.join("worktrees"),
         committed: Arc::new(Mutex::new(0)),
         pushed: Arc::new(Mutex::new(0)),
+        commit_results: Arc::new(Mutex::new(Vec::new())),
+        push_failures_remaining: Arc::new(Mutex::new(0)),
+        branch_has_diff: Arc::new(Mutex::new(false)),
     }
 }
 
@@ -600,6 +648,122 @@ async fn reviewer_request_failure_does_not_block_pr_state() {
     assert_eq!(stored.state, ManagedState::PrOpen);
     assert_eq!(stored.pr_number, Some(1));
     assert_eq!(*workspace.committed.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn push_failure_retry_reuses_existing_branch_diff() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(project_item("Todo"), vec![admin_comment()]);
+    let workspace = fake_workspace(temp.path());
+    let daemon =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    workspace.fail_next_push();
+    daemon.run_once().await.unwrap();
+
+    let store = Store::open(&state_path).unwrap();
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::Working);
+    assert!(github.state.lock().unwrap().pr.is_none());
+
+    workspace.set_commit_results(vec![false]);
+    daemon.run_once().await.unwrap();
+
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::PrOpen);
+    assert_eq!(stored.pr_number, Some(1));
+    assert_eq!(github.state.lock().unwrap().prs_created, 1);
+}
+
+#[tokio::test]
+async fn marker_recovery_detects_merged_pr_after_store_loss() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(project_item("Todo"), vec![admin_comment()]);
+    let workspace = fake_workspace(temp.path());
+    let daemon = Daemon::with_components(
+        config.clone(),
+        github.clone(),
+        FakeRunner,
+        workspace.clone(),
+    )
+    .unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    daemon.run_once().await.unwrap();
+    github.merge_pr();
+    std::fs::remove_file(&state_path).unwrap();
+
+    let recovered =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+    recovered.run_once().await.unwrap();
+
+    let store = Store::open(state_path).unwrap();
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::Done);
+}
+
+#[tokio::test]
+async fn branch_recovery_handles_old_markers_with_open_pr() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(project_item("Todo"), vec![admin_comment()]);
+    let workspace = fake_workspace(temp.path());
+    let daemon = Daemon::with_components(
+        config.clone(),
+        github.clone(),
+        FakeRunner,
+        workspace.clone(),
+    )
+    .unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    daemon.run_once().await.unwrap();
+    github.drop_pr_progress_comments();
+    github.request_changes();
+    std::fs::remove_file(&state_path).unwrap();
+
+    let recovered =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+    recovered.run_once().await.unwrap();
+
+    assert_eq!(*workspace.committed.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn closed_pr_restarts_work_and_opens_replacement() {
+    let temp = tempdir().unwrap();
+    let target = target(temp.path().join("checkout"));
+    let config = config(temp.path(), target);
+    let state_path = config.state_path();
+    let github = FakeGitHub::new(project_item("Todo"), vec![admin_comment()]);
+    let workspace = fake_workspace(temp.path());
+    let daemon =
+        Daemon::with_components(config, github.clone(), FakeRunner, workspace.clone()).unwrap();
+
+    daemon.run_once().await.unwrap();
+    github.set_status("In Progress");
+    daemon.run_once().await.unwrap();
+    github.close_pr_without_merge();
+
+    daemon.run_once().await.unwrap();
+
+    let store = Store::open(state_path).unwrap();
+    let stored = store.get_item("owner", "repo", "ITEM_1").unwrap().unwrap();
+    assert_eq!(stored.state, ManagedState::PrOpen);
+    assert_eq!(stored.pr_number, Some(1));
+    assert_eq!(github.state.lock().unwrap().prs_created, 2);
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use time::OffsetDateTime;
 
 use crate::github::{
@@ -59,24 +59,12 @@ pub(crate) struct PageInfo {
 pub(crate) struct ProjectItemNode {
     id: String,
     content: Option<ProjectContentNode>,
-    #[serde(rename = "fieldValues")]
-    field_values: FieldValueConnection,
+    #[serde(rename = "statusFieldValue")]
+    status_field_value: Option<ProjectItemStatusValueNode>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FieldValueConnection {
-    nodes: Vec<FieldValueNode>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FieldValueNode {
-    name: Option<String>,
-    field: Option<FieldNameNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FieldNameNode {
+struct ProjectItemStatusValueNode {
     name: String,
 }
 
@@ -108,19 +96,8 @@ enum ProjectContentNode {
 }
 
 impl ProjectItemNode {
-    pub(crate) fn into_project_item(self, status_field: &str) -> Option<ProjectItem> {
-        let status = self
-            .field_values
-            .nodes
-            .into_iter()
-            .find(|value| {
-                value
-                    .field
-                    .as_ref()
-                    .map(|field| field.name == status_field)
-                    .unwrap_or(false)
-            })
-            .and_then(|value| value.name);
+    pub(crate) fn into_project_item(self) -> Option<ProjectItem> {
+        let status = self.status_field_value.map(|value| value.name);
 
         let content = self.content.and_then(|content| match content {
             ProjectContentNode::Issue {
@@ -176,27 +153,21 @@ impl ProjectItemNode {
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct ProjectFieldsResponse {
-    pub(crate) node: ProjectFieldsNode,
+pub(crate) struct ProjectStatusFieldResponse {
+    pub(crate) node: ProjectStatusFieldNode,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
-pub(crate) struct ProjectFieldsNode {
-    pub(crate) fields: ProjectFieldConnection,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Deserialize)]
-pub(crate) struct ProjectFieldConnection {
-    pub(crate) nodes: Vec<Option<ProjectFieldNode>>,
+pub(crate) struct ProjectStatusFieldNode {
+    #[serde(rename = "statusField")]
+    pub(crate) status_field: Option<ProjectFieldNode>,
 }
 
 #[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectFieldNode {
     pub(crate) id: String,
-    pub(crate) name: String,
     #[serde(default)]
     pub(crate) options: Vec<ProjectFieldOption>,
 }
@@ -212,6 +183,71 @@ pub(crate) struct ProjectFieldOption {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UserResponse {
     pub(crate) login: String,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullRequestReviewStateResponse {
+    pub(crate) repository: Option<PullRequestReviewRepositoryNode>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullRequestReviewRepositoryNode {
+    #[serde(rename = "pullRequest")]
+    pub(crate) pull_request: Option<PullRequestReviewNodeState>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullRequestReviewNodeState {
+    #[serde(rename = "reviewDecision")]
+    pub(crate) review_decision: Option<PullRequestReviewDecisionValue>,
+    #[serde(rename = "latestOpinionatedReviews")]
+    pub(crate) latest_opinionated_reviews: Option<PullRequestReviewConnection>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullRequestReviewConnection {
+    pub(crate) nodes: Vec<PullRequestReviewNode>,
+    #[serde(rename = "pageInfo")]
+    pub(crate) page_info: PageInfo,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PullRequestReviewNode {
+    #[serde(
+        rename = "fullDatabaseId",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
+    pub(crate) full_database_id: Option<i64>,
+    pub(crate) body: String,
+    pub(crate) state: PullRequestReviewStateValue,
+    #[serde(rename = "submittedAt", default, with = "time::serde::rfc3339::option")]
+    pub(crate) submitted_at: Option<OffsetDateTime>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PullRequestReviewDecisionValue {
+    ChangesRequested,
+    Approved,
+    ReviewRequired,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PullRequestReviewStateValue {
+    Pending,
+    Commented,
+    Approved,
+    ChangesRequested,
+    Dismissed,
 }
 
 #[non_exhaustive]
@@ -253,7 +289,7 @@ pub(crate) struct ReviewThreadNode {
     pub(crate) path: String,
     #[serde(default)]
     pub(crate) line: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "originalLine", default)]
     pub(crate) original_line: Option<i64>,
     pub(crate) comments: ReviewThreadCommentConnection,
 }
@@ -262,6 +298,20 @@ pub(crate) struct ReviewThreadNode {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReviewThreadCommentConnection {
     pub(crate) nodes: Vec<ReviewThreadCommentNode>,
+    #[serde(rename = "pageInfo")]
+    pub(crate) page_info: PageInfo,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReviewThreadCommentsResponse {
+    pub(crate) node: Option<ReviewThreadCommentsNode>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReviewThreadCommentsNode {
+    pub(crate) comments: ReviewThreadCommentConnection,
 }
 
 #[non_exhaustive]
@@ -275,17 +325,37 @@ pub(crate) struct ReviewThreadCommentNode {
 }
 
 impl ReviewThreadNode {
-    pub(crate) fn into_review_thread(self) -> ReviewThread {
-        ReviewThread {
-            id: self.id,
-            is_resolved: self.is_resolved,
-            is_outdated: self.is_outdated,
-            path: self.path,
-            line: self.line,
-            original_line: self.original_line,
-            comments: self
-                .comments
-                .nodes
+    pub(crate) fn into_review_thread_parts(self) -> (ReviewThread, PageInfo) {
+        let ReviewThreadNode {
+            id,
+            is_resolved,
+            is_outdated,
+            path,
+            line,
+            original_line,
+            comments,
+        } = self;
+        let (comments, page_info) = comments.into_parts();
+        (
+            ReviewThread {
+                id,
+                is_resolved,
+                is_outdated,
+                path,
+                line,
+                original_line,
+                comments,
+            },
+            page_info,
+        )
+    }
+}
+
+impl ReviewThreadCommentConnection {
+    pub(crate) fn into_parts(self) -> (Vec<ReviewThreadComment>, PageInfo) {
+        let ReviewThreadCommentConnection { nodes, page_info } = self;
+        (
+            nodes
                 .into_iter()
                 .map(|comment| ReviewThreadComment {
                     author: comment.author.map(|user| user.login).unwrap_or_default(),
@@ -294,7 +364,8 @@ impl ReviewThreadNode {
                     html_url: comment.url,
                 })
                 .collect(),
-        }
+            page_info,
+        )
     }
 }
 
@@ -306,7 +377,7 @@ query ResolveProject($login: String!, $number: Int!) {
 "#;
 
 pub(crate) const PROJECT_ITEMS_QUERY: &str = r#"
-query ProjectItems($projectId: ID!, $after: String) {
+query ProjectItems($projectId: ID!, $statusField: String!, $after: String) {
   node(id: $projectId) {
     ... on ProjectV2 {
       items(first: 100, after: $after) {
@@ -317,13 +388,8 @@ query ProjectItems($projectId: ID!, $after: String) {
             ... on Issue { id number title body author { login } createdAt url }
             ... on PullRequest { id number title body author { login } createdAt url }
           }
-          fieldValues(first: 20) {
-            nodes {
-              ... on ProjectV2ItemFieldSingleSelectValue {
-                name
-                field { ... on ProjectV2SingleSelectField { name } }
-              }
-            }
+          statusFieldValue: fieldValueByName(name: $statusField) {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
           }
         }
         pageInfo { hasNextPage endCursor }
@@ -333,17 +399,14 @@ query ProjectItems($projectId: ID!, $after: String) {
 }
 "#;
 
-pub(crate) const PROJECT_FIELDS_QUERY: &str = r#"
-query ProjectFields($projectId: ID!) {
+pub(crate) const PROJECT_STATUS_FIELD_QUERY: &str = r#"
+query ProjectStatusField($projectId: ID!, $statusField: String!) {
   node(id: $projectId) {
     ... on ProjectV2 {
-      fields(first: 50) {
-        nodes {
-          ... on ProjectV2SingleSelectField {
-            id
-            name
-            options { id name }
-          }
+      statusField: field(name: $statusField) {
+        ... on ProjectV2SingleSelectField {
+          id
+          options { id name }
         }
       }
     }
@@ -360,6 +423,25 @@ mutation UpdateProjectStatus($projectId: ID!, $itemId: ID!, $fieldId: ID!, $opti
     value: { singleSelectOptionId: $optionId }
   }) {
     projectV2Item { id }
+  }
+}
+"#;
+
+pub(crate) const PULL_REQUEST_REVIEW_STATE_QUERY: &str = r#"
+query PullRequestReviewState($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewDecision
+      latestOpinionatedReviews(first: 100, after: $after) {
+        nodes {
+          fullDatabaseId
+          body
+          state
+          submittedAt
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
   }
 }
 "#;
@@ -383,6 +465,7 @@ query PullRequestReviewThreads($owner: String!, $repo: String!, $number: Int!, $
               diffHunk
               url
             }
+            pageInfo { hasNextPage endCursor }
           }
         }
         pageInfo { hasNextPage endCursor }
@@ -391,3 +474,92 @@ query PullRequestReviewThreads($owner: String!, $repo: String!, $number: Int!, $
   }
 }
 "#;
+
+pub(crate) const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"
+query PullRequestReviewThreadComments($threadId: ID!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        nodes {
+          author { login }
+          body
+          diffHunk
+          url
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"#;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum I64Value {
+    Integer(i64),
+    String(String),
+}
+
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<I64Value>::deserialize(deserializer)? {
+        Some(I64Value::Integer(value)) => Ok(Some(value)),
+        Some(I64Value::String(value)) => value.parse().map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn project_item_node_reads_targeted_status_field() {
+        let node: ProjectItemNode = serde_json::from_value(json!({
+            "id": "PVTI_1",
+            "content": null,
+            "statusFieldValue": { "name": "In Progress" }
+        }))
+        .unwrap();
+
+        let item = node.into_project_item().unwrap();
+        assert_eq!(item.id, "PVTI_1");
+        assert_eq!(item.status.as_deref(), Some("In Progress"));
+        assert!(item.content.is_none());
+    }
+
+    #[test]
+    fn review_thread_node_preserves_comment_page_info() {
+        let node: ReviewThreadNode = serde_json::from_value(json!({
+            "id": "PRRT_1",
+            "isResolved": false,
+            "isOutdated": false,
+            "path": "src/lib.rs",
+            "line": null,
+            "originalLine": 42,
+            "comments": {
+                "nodes": [{
+                    "author": { "login": "reviewer" },
+                    "body": "Please fix this.",
+                    "diffHunk": "@@ -1 +1 @@\n-old\n+new",
+                    "url": "https://example.com/comment"
+                }],
+                "pageInfo": {
+                    "hasNextPage": true,
+                    "endCursor": "cursor-1"
+                }
+            }
+        }))
+        .unwrap();
+
+        let (thread, page_info) = node.into_review_thread_parts();
+        assert_eq!(thread.id, "PRRT_1");
+        assert_eq!(thread.comments.len(), 1);
+        assert_eq!(thread.original_line, Some(42));
+        assert!(page_info.has_next_page);
+        assert_eq!(page_info.end_cursor.as_deref(), Some("cursor-1"));
+    }
+}

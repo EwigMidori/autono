@@ -161,6 +161,8 @@ impl BotMentionPolicy {
 pub(crate) struct AutonoMarker {
     item_id: String,
     state: ManagedState,
+    branch: Option<String>,
+    pr_number: Option<i64>,
 }
 
 impl AutonoMarker {
@@ -168,18 +170,45 @@ impl AutonoMarker {
         Self {
             item_id: item_id.to_string(),
             state,
+            branch: None,
+            pr_number: None,
         }
     }
 
     pub(crate) fn render(&self) -> String {
-        format!(
-            "{MARKER_PREFIX} item={} state={} {MARKER_SUFFIX}",
-            self.item_id, self.state
-        )
+        let mut parts = vec![
+            format!("item={}", self.item_id),
+            format!("state={}", self.state),
+        ];
+        if let Some(branch) = &self.branch {
+            parts.push(format!("branch={branch}"));
+        }
+        if let Some(pr_number) = self.pr_number {
+            parts.push(format!("pr={pr_number}"));
+        }
+        format!("{MARKER_PREFIX} {} {MARKER_SUFFIX}", parts.join(" "))
     }
 
     pub(crate) fn state(&self) -> ManagedState {
         self.state
+    }
+
+    pub(crate) fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    pub(crate) fn pr_number(&self) -> Option<i64> {
+        self.pr_number
+    }
+
+    pub(crate) fn with_branch(mut self, branch: &str) -> Self {
+        self.branch = Some(branch.to_string());
+        self
+    }
+
+    pub(crate) fn with_pr_number(mut self, pr_number: i64) -> Self {
+        self.pr_number = Some(pr_number);
+        self
     }
 
     pub(crate) fn find_in(body: &str) -> Option<Self> {
@@ -187,14 +216,26 @@ impl AutonoMarker {
         let rest = &body[start..];
         let end = rest.find(MARKER_SUFFIX)?;
         let marker = &rest[..end];
-        let item_id = marker
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("item="))?;
-        let state = marker
-            .split_whitespace()
+        let parts = marker.split_whitespace().collect::<Vec<_>>();
+        let item_id = parts.iter().find_map(|part| part.strip_prefix("item="))?;
+        let state = parts
+            .iter()
             .find_map(|part| part.strip_prefix("state="))
             .and_then(|state| ManagedState::from_str(state).ok())?;
-        Some(Self::new(item_id, state))
+        let branch = parts
+            .iter()
+            .find_map(|part| part.strip_prefix("branch="))
+            .map(ToString::to_string);
+        let pr_number = parts
+            .iter()
+            .find_map(|part| part.strip_prefix("pr="))
+            .and_then(|pr| pr.parse().ok());
+        Some(Self {
+            item_id: item_id.to_string(),
+            state,
+            branch,
+            pr_number,
+        })
     }
 }
 
@@ -263,6 +304,8 @@ impl CommentThread {
                 AutonoMarker::find_in(&comment.body).map(|marker| MarkerView {
                     comment_id: comment.id,
                     state: marker.state(),
+                    branch: marker.branch().map(ToString::to_string),
+                    pr_number: marker.pr_number(),
                 })
             })
             .max_by_key(|marker| marker.comment_id)
@@ -290,10 +333,12 @@ pub(crate) struct AdminMention {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MarkerView {
     pub(crate) comment_id: i64,
     pub(crate) state: ManagedState,
+    pub(crate) branch: Option<String>,
+    pub(crate) pr_number: Option<i64>,
 }
 
 #[cfg(test)]
@@ -325,11 +370,14 @@ mod tests {
 
     #[test]
     fn marker_parser_recovers_state() {
-        let marker = AutonoMarker::new("I_1", ManagedState::AwaitingStart).render();
-        assert_eq!(
-            AutonoMarker::find_in(&marker).map(|marker| marker.state()),
-            Some(ManagedState::AwaitingStart)
-        );
+        let marker = AutonoMarker::new("I_1", ManagedState::AwaitingStart)
+            .with_branch("agent/test")
+            .with_pr_number(42)
+            .render();
+        let marker = AutonoMarker::find_in(&marker).unwrap();
+        assert_eq!(marker.state(), ManagedState::AwaitingStart);
+        assert_eq!(marker.branch(), Some("agent/test"));
+        assert_eq!(marker.pr_number(), Some(42));
         assert_eq!(AutonoMarker::find_in("plain comment"), None);
     }
 
